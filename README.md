@@ -3,7 +3,7 @@
 ![status](https://img.shields.io/badge/status-working-brightgreen)
 ![language](https://img.shields.io/badge/language-Lyx-blue)
 ![platform](https://img.shields.io/badge/platform-Linux%2FX11-lightgrey)
-![formats](https://img.shields.io/badge/formats-MMD0%2F1%2F2%20%C2%B7%20MOD%20%C2%B7%20S3M-orange)
+![formats](https://img.shields.io/badge/formats-MMD%20%C2%B7%20MOD%20%C2%B7%20S3M%20%C2%B7%20XM-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 A music tracker for **LyxOS**, written in the **Lyx** language on the **Vega** VCL,
@@ -31,8 +31,8 @@ and 8-bit resolution — because that is what made it sound the way it did.
   different in each.
 - **Effect commands** `00`–`1F` including the `0F` special cases, plus a separate MIDI command
   dispatch for MIDI tracks.
-- **File formats** — reads MMD0/MMD1/MMD2 (OctaMED), ProTracker MOD and Scream Tracker 3 S3M,
-  writes MMD1, loads IFF-8SVX and raw 8-bit samples.
+- **File formats** — reads MMD0/MMD1/MMD2 (OctaMED), ProTracker MOD, Scream Tracker 3 S3M and
+  FastTracker 2 XM, writes MMD1, loads IFF-8SVX and raw 8-bit samples.
 - **MIDI output** — an instrument with a MIDI channel plays on the device instead of the
   sample backend; both run side by side from the same block.
 - **Song sequence and sections**, block properties, range operations (cut/copy/paste/clear,
@@ -192,12 +192,19 @@ transpose · `Edit` cut, copy, paste and clear range · `Instrument` properties,
 | MMD2 / MMD3 | yes | — | Sections become multiple playing sequences |
 | ProTracker MOD | yes | — | M.K., M!K!, FLT4/8, 4CHN, 6CHN, 8CHN, CD81, OKTA |
 | Scream Tracker 3 (S3M) | yes | — | Up to 16 channels, packed patterns, unsigned samples, per-instrument c2spd |
+| FastTracker 2 (XM) | yes | — | Packed patterns of any row count, delta-encoded samples, relative note and finetune |
 | IFF-8SVX | yes | — | Samples; Fibonacci-delta compression is rejected, not guessed |
 | Raw 8-bit | yes | — | Headerless sample data |
 
 Paula always writes MMD1: MMD0 cannot represent commands above `0F` or 6-bit instrument
 numbers, and MMD2 would only add sections. Effects from MOD and S3M files are mapped onto
 OctaMED command numbers; anything without an equivalent is dropped rather than mistranslated.
+
+XM samples are **delta-encoded** — each byte is the difference from its predecessor. Miss that
+and every instrument turns into noise; it is the classic mistake when reading the format. Per
+instrument only the first sample is taken, and envelopes, note-to-sample mapping and panning
+are left out: the data model of an OctaMED-style tracker has no place for them, and guessing
+would be worse than omitting.
 
 S3M is a PC format and is treated as one. Its instruments are tuned by playback rate (`c2spd`)
 rather than by an Amiga period table, so periods are scaled per instrument, and such a song
@@ -223,6 +230,7 @@ OMED/
   MMD.lyx           MMD0/1/2 reader and MMD1 writer
   MOD.lyx           ProTracker MOD reader
   S3M.lyx           Scream Tracker 3 reader
+  XM.lyx            FastTracker 2 reader
   Dialogs.lyx       block properties, song sequence, instrument, MIDI setup
 docs/DESIGN.de.md   the original design specification (German)
 ```
@@ -239,6 +247,7 @@ lyxc mmdtest.lyx    -I /path/to/aurum -o mmdtest    && ./mmdtest      # MMD read
 lyxc miditest.lyx   -I /path/to/aurum -o miditest   && ./miditest     # MIDI byte stream
 lyxc modtest.lyx    -I /path/to/aurum -o modtest    && ./modtest      # MOD import
 lyxc s3mtest.lyx    -I /path/to/aurum -o s3mtest    && ./s3mtest      # S3M import
+lyxc xmtest.lyx     -I /path/to/aurum -o xmtest     && ./xmtest       # XM import
 lyxc synthtest.lyx  -I /path/to/aurum -o synthtest  && ./synthtest    # computed instruments
 lyxc sampletest.lyx -I /path/to/aurum -o sampletest && ./sampletest   # samples, periods, mixing
 lyxc renderwav.lyx  -I /path/to/aurum -o renderwav  && ./renderwav    # render to WAV per backend

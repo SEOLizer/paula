@@ -20,6 +20,7 @@ import OMED.Replay;
 import OMED.MMD;
 import OMED.MOD;
 import OMED.S3M;
+import OMED.XM;
 
 fn Show(label: pchar, v: int64): void {
   PrintStr(label);
@@ -128,20 +129,22 @@ fn main(): int64 {
   // Liegt ein Modul daneben, wird das gerendert — sonst der eingebaute
   // Demo-Song. So laesst sich pruefen, ob ein Stueck gleichmaessig klingt,
   // ohne die Oberflaeche und die Soundkarte dazwischen.
-  var song: TSong := BuildDemo();
+  var song: TSong := LoadXM("/home/andreas/PhpstormProjects/lyx-octaMED/x-files2.xm");
+  if (song == null) { song := BuildDemo(); }
+  else { PrintStrLn("gerendert wird x-files2.xm"); }
   var sekunden: int64 := 20;
 
   // Derselbe Song durch alle drei Backends. Genau darum geht es in der
   // Design-Spec: dieselbe Datei muss in jedem Modus hoerbar anders klingen.
   Show("paula  peak",
        RenderTo(song, NewPaula4ChannelBackend() as TPlaybackBackend,
-                sekunden, "demo-paula.wav"));
+                sekunden, "xm-paula.wav"));
   Show("8ch    peak",
        RenderTo(song, NewOctaMed8ChannelBackend() as TPlaybackBackend,
-                sekunden, "demo-8ch.wav"));
+                sekunden, "xm-8ch.wav"));
   Show("mixer  peak",
        RenderTo(song, NewSoftwareMixerBackend(16) as TPlaybackBackend,
-                sekunden, "demo-mixer.wav"));
-  PrintStrLn("geschrieben: demo-paula.wav, demo-8ch.wav, demo-mixer.wav");
+                sekunden, "xm-mixer.wav"));
+  PrintStrLn("geschrieben: xm-paula.wav, xm-8ch.wav, xm-mixer.wav");
   return 0;
 }
