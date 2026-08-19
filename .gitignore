@@ -25,4 +25,9 @@ latencytest
 *.mod
 *.med
 *.mmd
+*.s3m
+*.xm
+*.it
+*.mtm
+*.stm
 /Songs/
