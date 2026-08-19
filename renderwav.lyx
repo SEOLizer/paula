@@ -18,6 +18,7 @@ import OMED.Playback;
 import OMED.Replay;
 import OMED.MMD;
 import OMED.MOD;
+import OMED.S3M;
 
 fn Show(label: pchar, v: int64): void {
   PrintStr(label);
@@ -132,22 +133,22 @@ fn main(): int64 {
   // Liegt ein Modul daneben, wird das gerendert — sonst der eingebaute
   // Demo-Song. So laesst sich pruefen, ob ein Stueck gleichmaessig klingt,
   // ohne die Oberflaeche und die Soundkarte dazwischen.
-  var song: TSong := LoadMOD("/home/andreas/PhpstormProjects/lyx-octaMED/alone.mod");
+  var song: TSong := LoadS3M("/home/andreas/PhpstormProjects/lyx-octaMED/top_gun.s3m");
   if (song == null) { song := BuildDemo(); }
-  else { PrintStrLn("gerendert wird alone.mod"); }
+  else { PrintStrLn("gerendert wird top_gun.s3m"); }
   var sekunden: int64 := 20;
 
   // Derselbe Song durch alle drei Backends. Genau darum geht es in der
   // Design-Spec: dieselbe Datei muss in jedem Modus hoerbar anders klingen.
   Show("paula  peak",
        RenderTo(song, NewPaula4ChannelBackend() as TPlaybackBackend,
-                sekunden, "alone-paula.wav"));
+                sekunden, "s3m-paula.wav"));
   Show("8ch    peak",
        RenderTo(song, NewOctaMed8ChannelBackend() as TPlaybackBackend,
-                sekunden, "alone-8ch.wav"));
+                sekunden, "s3m-8ch.wav"));
   Show("mixer  peak",
-       RenderTo(song, NewSoftwareMixerBackend(8) as TPlaybackBackend,
-                sekunden, "alone-mixer.wav"));
-  PrintStrLn("geschrieben: alone-paula.wav, alone-8ch.wav, alone-mixer.wav");
+       RenderTo(song, NewSoftwareMixerBackend(16) as TPlaybackBackend,
+                sekunden, "s3m-mixer.wav"));
+  PrintStrLn("geschrieben: s3m-paula.wav, s3m-8ch.wav, s3m-mixer.wav");
   return 0;
 }

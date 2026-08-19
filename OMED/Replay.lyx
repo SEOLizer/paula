@@ -394,6 +394,15 @@ pub type TReplayEngine = class {
     st.MidiChan := 0;
 
     var period: int64 := NotePeriod(note + ins.Transpose, ins.FineTune);
+
+    // Instrumente mit eigener Referenzrate (S3M) werden umgerechnet: die
+    // Periodentabelle gilt fuer 8363 Hz, ein mit 16000 Hz gesampeltes
+    // Instrument klaenge sonst fast eine Oktave zu hoch.
+    if (ins.C2Rate > 0) {
+      period := (period * OM_AMIGA_C2RATE) / ins.C2Rate;
+      if (period < 1) { period := 1; }
+    }
+
     st.BasePeriod := period;
     st.Period := period;
     st.ArpNote := period;

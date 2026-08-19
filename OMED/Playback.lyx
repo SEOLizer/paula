@@ -23,6 +23,10 @@ pub con OM_PAL_CLOCK: int64 := 3546895;
 pub con OM_MIX_RATE: int64 := 44100;
 pub con OM_MIX_CHANNELS: int64 := 8;
 
+// Rate, fuer die die Amiga-Periodentabelle gilt. Wer sein Instrument mit einer
+// anderen Rate gesampelt hat, muss die Periode dagegen verrechnen.
+pub con OM_AMIGA_C2RATE: int64 := 8363;
+
 // Periodentabelle, Oktave 1 (C-1..B-1), Finetune 0 — die Werte aus der
 // Amiga-Replayroutine. Hoehere Oktaven halbieren die Periode.
 fn BasePeriod(st: int64): int64 {
@@ -152,12 +156,21 @@ pub type TSoftwareMixerBackend = class extends TPlaybackBackend {
   Voices: TIntArray;   // Zeiger auf TVoice, ein Eintrag je Kanal
   Count: int64;
 
+  // Kopffreiheit: acht Stimmen passen bei voller Aussteuerung noch in 16 Bit,
+  // sechzehn nicht mehr. Ohne diesen Teiler klemmt die Summe bei dichten
+  // Stellen ab — gemessen an einem 16-Spur-S3M waren das 3326 abgeschnittene
+  // Werte, hoerbar als Verzerrung. Der Teiler waechst mit der Stimmenzahl,
+  // nicht mit der Lautstaerke, damit dasselbe Stueck immer gleich klingt.
+  Headroom: int64;
+
   fn Create(channels: int64): void {
     var n: int64 := channels;
     if (n < 1) { n := 1; }
     if (n > 64) { n := 64; }
     self.Count := n;
     self.Rate := OM_MIX_RATE;
+    self.Headroom := (n + 7) / 8;
+    if (self.Headroom < 1) { self.Headroom := 1; }
     self.Voices := new TIntArray(n);
     var i: int64 := 0;
     while (i < n) {
@@ -250,8 +263,8 @@ pub type TSoftwareMixerBackend = class extends TPlaybackBackend {
             if (pl > 64) { pl := 64; }
             if (pr < 0) { pr := 0; }
             if (pr > 64) { pr := 64; }
-            l := l + ((s * pl) / 64);
-            r := r + ((s * pr) / 64);
+            l := l + ((s * pl) / (64 * self.Headroom));
+            r := r + ((s * pr) / (64 * self.Headroom));
             v.Advance();
           }
         }

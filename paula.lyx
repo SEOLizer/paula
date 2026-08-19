@@ -37,6 +37,7 @@ import OMED.Midi;
 import OMED.Dialogs;
 import OMED.MMD;
 import OMED.MOD;
+import OMED.S3M;
 import std.fs;
 
 con WIN_W: int64 := 720;
@@ -179,7 +180,16 @@ con MODE_MIXER: int64 := 2;
 fn SetPlaybackMode(mode: int64): void {
   g_mode := mode;
   if (mode == MODE_MIXER) {
-    g_backend := NewSoftwareMixerBackend(OM_MIX_CHANNELS) as TPlaybackBackend;
+    // So viele Stimmen wie der Song Spuren hat: ein 16-Spur-Modul auf acht
+    // Stimmen zu spielen hiesse, die Haelfte stumm zu lassen.
+    var voices: int64 := OM_MIX_CHANNELS;
+    if (g_song != null) {
+      var b0: TBlock := g_song.BlockAt(0);
+      if (b0 != null) {
+        if (b0.Tracks > voices) { voices := b0.Tracks; }
+      }
+    }
+    g_backend := NewSoftwareMixerBackend(voices) as TPlaybackBackend;
   } else {
     if (mode == MODE_8CH) {
       g_backend := NewOctaMed8ChannelBackend() as TPlaybackBackend;
@@ -464,11 +474,14 @@ fn ActLoadSong(sender: TControl): void {
     // Format am Inhalt erkennen, nicht an der Endung. MOD traegt seine
     // Kennung bei Byte 1080, MMD am Anfang — beide sagen es also selbst.
     var loaded: TSong := null;
-    if (IsMOD(path.AsPChar())) { loaded := LoadMOD(path.AsPChar()); }
-    else { loaded := LoadMMD(path.AsPChar()); }
+    if (IsS3M(path.AsPChar())) { loaded := LoadS3M(path.AsPChar()); }
+    else {
+      if (IsMOD(path.AsPChar())) { loaded := LoadMOD(path.AsPChar()); }
+      else { loaded := LoadMMD(path.AsPChar()); }
+    }
 
     if (loaded == null) {
-      PrintStrLn("Paula: kein lesbares Modul (MMD0/1/2 oder MOD)");
+      PrintStrLn("Paula: kein lesbares Modul (MMD0/1/2, MOD oder S3M)");
     } else {
       // Der geladene Modus gehoert zum Song: FLAG_8CHANNEL entscheidet in
       // AdoptSong, mit welchem Backend das Stueck klingen soll.
@@ -486,8 +499,13 @@ fn AdoptSong(s: TSong): void {
   g_song := s;
   g_block_no := 0;
 
-  if (g_song.EightChannel) { SetPlaybackMode(MODE_8CH); }
-  else { SetPlaybackMode(MODE_PAULA); }
+  // Der Song sagt, wohin er gehoert: S3M in den Mixer, FLAG_8CHANNEL in den
+  // 8-Kanal-Modus, alles andere auf die Paula.
+  if (g_song.MixMode) { SetPlaybackMode(MODE_MIXER); }
+  else {
+    if (g_song.EightChannel) { SetPlaybackMode(MODE_8CH); }
+    else { SetPlaybackMode(MODE_PAULA); }
+  }
 
   if (g_replay != null) { g_replay.Attach(g_song, g_backend); }
   if (g_grid != null) { g_grid.Attach(g_song, g_song.BlockAt(0)); }

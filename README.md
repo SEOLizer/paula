@@ -3,7 +3,7 @@
 ![status](https://img.shields.io/badge/status-working-brightgreen)
 ![language](https://img.shields.io/badge/language-Lyx-blue)
 ![platform](https://img.shields.io/badge/platform-LyxOS%20%7C%20Linux%2FX11-lightgrey)
-![formats](https://img.shields.io/badge/formats-MMD0%2F1%2F2%20%C2%B7%20MOD-orange)
+![formats](https://img.shields.io/badge/formats-MMD0%2F1%2F2%20%C2%B7%20MOD%20%C2%B7%20S3M-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 A music tracker for **LyxOS**, written in the **Lyx** language on the **Vega** VCL,
@@ -31,8 +31,8 @@ and 8-bit resolution — because that is what made it sound the way it did.
   different in each.
 - **Effect commands** `00`–`1F` including the `0F` special cases, plus a separate MIDI command
   dispatch for MIDI tracks.
-- **File formats** — reads MMD0/MMD1/MMD2 (OctaMED) and ProTracker MOD, writes MMD1, loads
-  IFF-8SVX and raw 8-bit samples.
+- **File formats** — reads MMD0/MMD1/MMD2 (OctaMED), ProTracker MOD and Scream Tracker 3 S3M,
+  writes MMD1, loads IFF-8SVX and raw 8-bit samples.
 - **MIDI output** — an instrument with a MIDI channel plays on the device instead of the
   sample backend; both run side by side from the same block.
 - **Song sequence and sections**, block properties, range operations (cut/copy/paste/clear,
@@ -150,12 +150,17 @@ transpose · `Edit` cut, copy, paste and clear range · `Instrument` properties,
 | MMD1 | yes | yes | 4-byte notes; the format Paula saves in |
 | MMD2 / MMD3 | yes | — | Sections become multiple playing sequences |
 | ProTracker MOD | yes | — | M.K., M!K!, FLT4/8, 4CHN, 6CHN, 8CHN, CD81, OKTA |
+| Scream Tracker 3 (S3M) | yes | — | Up to 16 channels, packed patterns, unsigned samples, per-instrument c2spd |
 | IFF-8SVX | yes | — | Samples; Fibonacci-delta compression is rejected, not guessed |
 | Raw 8-bit | yes | — | Headerless sample data |
 
 Paula always writes MMD1: MMD0 cannot represent commands above `0F` or 6-bit instrument
-numbers, and MMD2 would only add sections. Effects from MOD files are mapped onto OctaMED
-command numbers; anything without an equivalent is dropped rather than mistranslated.
+numbers, and MMD2 would only add sections. Effects from MOD and S3M files are mapped onto
+OctaMED command numbers; anything without an equivalent is dropped rather than mistranslated.
+
+S3M is a PC format and is treated as one. Its instruments are tuned by playback rate (`c2spd`)
+rather than by an Amiga period table, so periods are scaled per instrument, and such a song
+opens in **Modern Mixer** mode — the hardware limits would be a defect here, not authenticity.
 
 ---
 
@@ -175,6 +180,7 @@ OMED/
   Midi.lyx          raw MIDI output
   MMD.lyx           MMD0/1/2 reader and MMD1 writer
   MOD.lyx           ProTracker MOD reader
+  S3M.lyx           Scream Tracker 3 reader
   Dialogs.lyx       block properties, song sequence, instrument, MIDI setup
 docs/DESIGN.de.md   the original design specification (German)
 ```
@@ -190,6 +196,7 @@ lyxc replaytest.lyx -I /path/to/aurum -o replaytest && ./replaytest   # engine, 
 lyxc mmdtest.lyx    -I /path/to/aurum -o mmdtest    && ./mmdtest      # MMD read/write round trip
 lyxc miditest.lyx   -I /path/to/aurum -o miditest   && ./miditest     # MIDI byte stream
 lyxc modtest.lyx    -I /path/to/aurum -o modtest    && ./modtest      # MOD import
+lyxc s3mtest.lyx    -I /path/to/aurum -o s3mtest    && ./s3mtest      # S3M import
 lyxc sampletest.lyx -I /path/to/aurum -o sampletest && ./sampletest   # samples, periods, mixing
 lyxc renderwav.lyx  -I /path/to/aurum -o renderwav  && ./renderwav    # render to WAV per backend
 ```
@@ -215,7 +222,6 @@ MMD import. Saving, MOD import and range operations were added afterwards.
   mix-mode commands `20`–`2F` are not implemented.
 - No sample editor, no preferences window.
 - No MMD2 export — saving keeps only the current section's sequence.
-- The software mixer clips slightly on dense material; it needs headroom or a master volume.
 - Redrawing the grid blocks Vega's loop for up to 335 ms, so audio runs with a 400 ms lead.
   The cursor therefore runs slightly ahead of the sound.
 

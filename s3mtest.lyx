@@ -1,0 +1,98 @@
+// s3mtest.lyx — Pruefprogramm fuer den S3M-Import.
+import std.io;
+import OMED.Song;
+import OMED.S3M;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintIntLn(v);
+}
+
+fn Check(label: pchar, got: int64, want: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintInt(got);
+  if (got == want) { PrintStrLn("  OK"); }
+  else { PrintStr("  ERWARTET "); PrintIntLn(want); }
+}
+
+fn main(): int64 {
+  // Notenumrechnung. Bezugspunkt: S3M-Oktave 4 ist unsere Oktave 2, weil
+  // c2spd fuer C-4 gilt und der Standardwert 8363 Hz auf dem Amiga die
+  // Periode 428 hat — also unser C-2 (Notennummer 13).
+  Check("S3M C-3 -> C-1", S3MNote(0x30), 1);
+  Check("S3M C-4 -> C-2", S3MNote(0x40), 13);
+  Check("S3M H-4 -> H-2", S3MNote(0x4B), 24);
+  Check("S3M C-5 -> C-3", S3MNote(0x50), 25);
+  Check("S3M C-7 -> C-5", S3MNote(0x70), 49);
+  Check("unterhalb des Bereichs wird gehalten", S3MNote(0x00), 1);
+  Check("note off", S3MNote(254), 0);
+  Check("leere zelle", S3MNote(255), 0);
+
+  var song: TSong := LoadS3M("/home/andreas/PhpstormProjects/lyx-octaMED/top_gun.s3m");
+  if (song == null) { PrintStrLn("NICHT GELADEN"); return 1; }
+
+  PrintStr("titel: "); PrintStrLn(song.Name);
+  Show("blocks", song.BlockCount);
+  Show("instrumente", song.InstrCount);
+  Show("sequenzlaenge", song.SeqLen());
+  Show("tracks", song.BlockAt(0).Tracks);
+  Show("lines", song.BlockAt(0).Lines);
+  Show("tempo", song.Tempo);
+  Show("tpl", song.Tpl);
+  Check("mix-modus", song.MixMode as int64, 1);
+
+  // Keine Note darf am oberen Rand kleben: das waere ein Zeichen dafuer, dass
+  // der Oktavversatz nicht stimmt.
+  var amRand: int64 := 0;
+
+  var noten: int64 := 0;
+  var mitCmd: int64 := 0;
+  var bi: int64 := 0;
+  while (bi < song.BlockCount) {
+    var b: TBlock := song.BlockAt(bi);
+    var l: int64 := 0;
+    while (l < b.Lines) {
+      var t: int64 := 0;
+      while (t < b.Tracks) {
+        var cc: int64 := b.Cell(l, t);
+        if (CellNote(cc) > 0) {
+          noten := noten + 1;
+          if (CellNote(cc) >= 72) { amRand := amRand + 1; }
+        }
+        if (CellCmd(cc) > 0) { mitCmd := mitCmd + 1; }
+        t := t + 1;
+      }
+      l := l + 1;
+    }
+    bi := bi + 1;
+  }
+  Show("zellen mit note", noten);
+  Show("zellen mit command", mitCmd);
+  Check("noten am oberen rand", amRand, 0);
+
+  var mitSample: int64 := 0;
+  var i: int64 := 1;
+  while (i <= song.InstrCount) {
+    var ins: TInstrument := song.Instrument(i);
+    if (ins != null) {
+      if (ins.SampleLen > 0) {
+        mitSample := mitSample + 1;
+        if (mitSample <= 5) {
+          PrintStr("  ");
+          PrintStr(ins.Name);
+          PrintStr("  len=");
+          PrintInt(ins.SampleLen);
+          PrintStr(" c2spd=");
+          PrintInt(ins.C2Rate);
+          PrintStr(" vol=");
+          PrintInt(ins.Volume);
+          PrintStr(" rep=");
+          PrintInt(ins.RepeatStart);
+          PrintStr("/");
+          PrintIntLn(ins.RepeatLen);
+        }
+      }
+    }
+    i := i + 1;
+  }
+  Show("instrumente mit sample", mitSample);
+  return 0;
+}

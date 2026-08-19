@@ -1,0 +1,381 @@
+// OMED/S3M.lyx — Scream-Tracker-3-Module lesen.
+//
+// S3M kommt vom PC, nicht vom Amiga, und das merkt man an jeder Ecke:
+//
+//   * Zahlen sind LITTLE endian — anders als in MMD und MOD.
+//   * Zeiger sind "Parapointer": die Zahl mal 16 ergibt den Offset. Ein
+//     Erbstueck der Segmentadressierung des 8086.
+//   * Patterns sind gepackt. Leere Zellen kosten kein Byte, eine Zeile endet
+//     mit einer Null.
+//   * Die Tonhoehe steht nicht in einer Periodentabelle, sondern als c2spd
+//     im Instrument: die Abspielrate fuer C-4.
+//   * Samples sind je nach Kopf vorzeichenlos (ffi = 2) und muessen beim
+//     Laden umgerechnet werden — sonst rauscht jede Note.
+//
+// Kopf (96 Byte):
+//   0x00 name[28], 0x1C 0x1A, 0x1D Typ (16 = Modul)
+//   0x20 ordnum, 0x22 insnum, 0x24 patnum, 0x26 flags, 0x28 cwtv, 0x2A ffi
+//   0x2C "SCRM"
+//   0x30 globalvol, 0x31 speed (Ticks je Line), 0x32 tempo (BPM),
+//   0x33 mastervol, 0x35 defaultpan
+//   0x40 Kanaleinstellungen[32]  (255 = unbenutzt, Bit 7 = abgeschaltet)
+//   0x60 Orders[ordnum], danach Parapointer der Instrumente und Patterns
+//
+// Nicht gelesen: Adlib-Instrumente (Typ 2 und hoeher), 16-Bit- und
+// Stereosamples, gepackte Sampledaten, Panoramawerte. Sie werden
+// uebersprungen, nicht geraten.
+
+@description("OctaMED-Tracker - Scream-Tracker-3-Module lesen")
+@author("Andreas Roene")
+unit OMED.S3M;
+
+import std.fs;
+import OMED.Song;
+
+pub con S3M_MAX_FILE: int64 := 32 * 1024 * 1024;
+pub con S3M_HEADER_LEN: int64 := 96;
+
+// Little endian, im Gegensatz zu allem anderen in diesem Programm.
+fn U16(p: int64): int64 {
+  return peek8(p) | (peek8(p + 1) << 8);
+}
+
+fn U32(p: int64): int64 {
+  return peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+}
+
+fn Tag4(p: int64, a: int64, b: int64, c: int64, d: int64): bool {
+  if (peek8(p) != a) { return false; }
+  if (peek8(p + 1) != b) { return false; }
+  if (peek8(p + 2) != c) { return false; }
+  if (peek8(p + 3) != d) { return false; }
+  return true;
+}
+
+fn CopyText(src: int64, maxLen: int64): pchar {
+  var len: int64 := 0;
+  var done: bool := false;
+  while (len < maxLen) {
+    if (done) { len := maxLen; }
+    else {
+      if (peek8(src + len) == 0) { done := true; }
+      else { len := len + 1; }
+    }
+  }
+  var dst: int64 := alloc(len + 1);
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(dst + i, peek8(src + i));
+    i := i + 1;
+  }
+  poke8(dst + len, 0);
+  return dst as pchar;
+}
+
+// Notenbyte: oberes Nibble Oktave, unteres Halbton. 255 ist leer, 254 ist
+// Note Off.
+//
+// Der Bezugspunkt muss stimmen, sonst liegt das ganze Stueck daneben: c2spd
+// ist in S3M die Abspielrate fuer C-4, und der Standardwert 8363 Hz ist auf
+// dem Amiga die Periode 428 — also unser C-2. S3M-Oktave 4 entspricht damit
+// unserer Oktave 2, und der Versatz betraegt drei Oktaven.
+//
+// Ohne diese Rechnung landet ein Stueck mit Oktaven bis 7 (in top_gun.s3m
+// sind es 16 Noten) oberhalb von B-6 und wird abgeschnitten.
+pub con S3M_OCTAVE_OFFSET: int64 := 3;
+
+pub fn S3MNote(b: int64): int64 {
+  if (b >= 254) { return 0; }
+  var oct: int64 := (b >> 4) & 0x0F;
+  var semi: int64 := b & 0x0F;
+  if (semi > 11) { return 0; }
+  var note: int64 := ((oct - S3M_OCTAVE_OFFSET) * 12) + semi + 1;
+  if (note < 1) { return 1; }
+  if (note > 72) { return 72; }
+  return note;
+}
+
+// ---- Effekte ---------------------------------------------------------------
+// S3M zaehlt seine Effekte als Buchstaben: 1 = A, 2 = B und so weiter. Die
+// Bedeutungen decken sich weitgehend mit ProTracker, die Nummern nicht.
+// Was keine Entsprechung in den OctaMED-Commands hat, wird verworfen statt
+// falsch uebersetzt.
+pub fn MapS3MEffect(fx: int64, param: int64, levelOut: int64): int64 {
+  poke64(levelOut, param);
+
+  if (fx == 1) { return 0x09; }         // A Set Speed (Ticks je Line)
+  if (fx == 2) { return 0x0B; }         // B Position Jump
+  if (fx == 3) { return 0x1D; }         // C Pattern Break
+  if (fx == 4) { return 0x0D; }         // D Volume Slide
+  if (fx == 5) { return 0x02; }         // E Slide Down
+  if (fx == 6) { return 0x01; }         // F Slide Up
+  if (fx == 7) { return 0x03; }         // G Tone Portamento
+  if (fx == 8) { return 0x04; }         // H Vibrato
+  if (fx == 10) { return 0x00; }        // J Arpeggio
+  if (fx == 11) { return 0x06; }        // K Vibrato + Volume Slide
+  if (fx == 12) { return 0x05; }        // L Portamento + Volume Slide
+  if (fx == 15) { return 0x19; }        // O Sample Offset
+  if (fx == 17) {                       // Q Retrigger + Volume Slide
+    poke64(levelOut, param & 0x0F);
+    return 0x1F;
+  }
+  if (fx == 18) { return 0x07; }        // R Tremolo
+  if (fx == 20) { return 0x0F; }        // T Set Tempo
+  if (fx == 21) { return 0x04; }        // U Fine Vibrato — naeherungsweise
+
+  if (fx == 19) {                       // S Spezialbefehle im oberen Nibble
+    var sub: int64 := (param >> 4) & 0x0F;
+    var val: int64 := param & 0x0F;
+    poke64(levelOut, val);
+    if (sub == 0x0C) { return 0x18; }                       // SCx Note Cut
+    if (sub == 0x0D) { poke64(levelOut, val << 4); return 0x1F; }  // SDx Note Delay
+    if (sub == 0x0E) { return 0x1E; }                       // SEx Pattern Delay
+  }
+
+  // I Tremor, M/N Kanalvolumen, V/W Globalvolumen, X/Y Panorama, Z Makro:
+  // dafuer gibt es in OctaMED V5 nichts Passendes.
+  poke64(levelOut, 0);
+  return 0x00;
+}
+
+// ---- Laden -----------------------------------------------------------------
+
+pub fn IsS3M(path: pchar): bool {
+  var buf: int64 := alloc(S3M_HEADER_LEN);
+  if (buf == 0) { return false; }
+  var n: int64 := ReadFile(path, buf as pchar, S3M_HEADER_LEN);
+  var ok: bool := false;
+  if (n >= S3M_HEADER_LEN) {
+    if (Tag4(buf + 0x2C, 83, 67, 82, 77)) { ok := true; }    // "SCRM"
+  }
+  free(buf, S3M_HEADER_LEN);
+  return ok;
+}
+
+pub fn LoadS3M(path: pchar): TSong {
+  var cap: int64 := S3M_MAX_FILE;
+  var data: int64 := alloc(cap);
+  if (data == 0) { return null; }
+  var size: int64 := ReadFile(path, data as pchar, cap);
+  if (size < S3M_HEADER_LEN) {
+    free(data, cap);
+    return null;
+  }
+  if (!Tag4(data + 0x2C, 83, 67, 82, 77)) {
+    free(data, cap);
+    return null;
+  }
+
+  var ordNum: int64 := U16(data + 0x20);
+  var insNum: int64 := U16(data + 0x22);
+  var patNum: int64 := U16(data + 0x24);
+  var ffi: int64 := U16(data + 0x2A);
+  var speed: int64 := peek8(data + 0x31);
+  var tempo: int64 := peek8(data + 0x32);
+
+  // Wie viele Kanaele sind wirklich belegt? Die Tabelle bei 0x40 fuehrt 32
+  // Plaetze; 255 heisst unbenutzt, gesetztes Bit 7 abgeschaltet. Gezaehlt
+  // wird bis zum letzten benutzten, weil die Spuren dazwischen ihre
+  // Nummerierung behalten muessen.
+  var channels: int64 := 0;
+  var c: int64 := 0;
+  while (c < 32) {
+    var cs: int64 := peek8(data + 0x40 + c);
+    if (cs != 255) {
+      if ((cs & 0x80) == 0) { channels := c + 1; }
+    }
+    c := c + 1;
+  }
+  if (channels < 1) { channels := 4; }
+  if (channels > OM_MAX_TRACKS) { channels := OM_MAX_TRACKS; }
+
+  var song: TSong := NewSong(CopyText(data, 28));
+  if (tempo > 0) { song.Tempo := tempo; }
+  if (speed > 0) { song.Tpl := speed; }
+  song.Lpb := 4;
+
+  // S3M ist kein Amiga-Format: seine Instrumente sind ueber Abspielraten
+  // gestimmt und seine Stuecke nutzen Oktaven, die auf der Paula gar nicht
+  // mehr sauber laufen. Deshalb der Mixer — die Hardwaregrenzen waeren hier
+  // keine Authentizitaet, sondern ein Fehler.
+  song.MixMode := true;
+
+  var ordOff: int64 := 0x60;
+  var insPP: int64 := ordOff + ordNum;
+  var patPP: int64 := insPP + (insNum * 2);
+  if (patPP + (patNum * 2) > size) {
+    free(data, cap);
+    return null;
+  }
+
+  // ---- Instrumente --------------------------------------------------------
+  var i: int64 := 0;
+  while (i < insNum) {
+    var para: int64 := U16(data + insPP + (i * 2));
+    var off: int64 := para * 16;
+    var ins: TInstrument := NewInstrument("");
+
+    if (off > 0) {
+      if (off + 0x50 <= size) {
+        var p: int64 := data + off;
+        var typ: int64 := peek8(p);
+        ins.Name := CopyText(p + 0x30, 28);
+        ins.Volume := peek8(p + 0x1C);
+        if (ins.Volume > 64) { ins.Volume := 64; }
+
+        // Typ 1 ist ein gewoehnliches Sample. Typ 2 und hoeher sind
+        // Adlib-Instrumente: dafuer gibt es hier keinen Klangerzeuger.
+        if (typ == 1) {
+          var flags: int64 := peek8(p + 0x1F);
+          var pack: int64 := peek8(p + 0x1E);
+          var len: int64 := U32(p + 0x10);
+          var loopBeg: int64 := U32(p + 0x14);
+          var loopEnd: int64 := U32(p + 0x18);
+          var c2spd: int64 := U32(p + 0x20);
+
+          // Sampledaten liegen wieder hinter einem Parapointer, diesmal aus
+          // drei Bytes: hohes Byte zuerst, dann ein Wort.
+          var memseg: int64 := (peek8(p + 0x0D) << 16) | U16(p + 0x0E);
+          var dataOff: int64 := memseg * 16;
+
+          var stereo: bool := (flags & 2) != 0;
+          var bits16: bool := (flags & 4) != 0;
+          if (pack == 0) {
+            if (!stereo) {
+              if (!bits16) {
+                if (len > 0) {
+                  if (dataOff + len <= size) {
+                    var dst: int64 := alloc(len);
+                    if (dst != 0) {
+                      var k: int64 := 0;
+                      while (k < len) {
+                        var v: int64 := peek8(data + dataOff + k);
+                        // ffi = 2 heisst vorzeichenlose Samples: 128 ist die
+                        // Null. Ungerechnet klaenge jede Note als Rauschen
+                        // mit einem gewaltigen Gleichanteil.
+                        if (ffi == 2) { v := (v - 128) & 0xFF; }
+                        poke8(dst + k, v);
+                        k := k + 1;
+                      }
+                      ins.SampleData := dst;
+                      ins.SampleLen := len;
+                      ins.SampleRate := c2spd;
+                      ins.C2Rate := c2spd;
+
+                      // Schleife: S3M zaehlt in Samples, unser Modell (wie
+                      // Paula) in Worten.
+                      if ((flags & 1) != 0) {
+                        if (loopEnd > loopBeg) {
+                          ins.RepeatStart := loopBeg / 2;
+                          ins.RepeatLen := (loopEnd - loopBeg) / 2;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    song.AddInstrument(ins);
+    i := i + 1;
+  }
+
+  // ---- Patterns -----------------------------------------------------------
+  // Gepackt: je Zeile eine Folge von Eintraegen, beendet durch eine Null.
+  // Das erste Byte eines Eintrags sagt, welcher Kanal gemeint ist und welche
+  // Felder folgen.
+  var levelBox: int64 := alloc(8);
+  var pat: int64 := 0;
+  while (pat < patNum) {
+    var b: TBlock := NewBlock(channels, 64);
+    var ppara: int64 := U16(data + patPP + (pat * 2));
+    var poff: int64 := ppara * 16;
+
+    if (poff > 0) {
+      if (poff + 2 <= size) {
+        var packedLen: int64 := U16(data + poff);
+        var q: int64 := poff + 2;
+        var ende: int64 := poff + 2 + packedLen;
+        if (ende > size) { ende := size; }
+
+        var line: int64 := 0;
+        while (line < 64) {
+          var zeileFertig: bool := false;
+          while (!zeileFertig) {
+            if (q >= ende) { zeileFertig := true; }
+            else {
+              var what: int64 := peek8(data + q);
+              q := q + 1;
+              if (what == 0) { zeileFertig := true; }
+              else {
+                var ch: int64 := what & 31;
+                var note: int64 := 0;
+                var instr: int64 := 0;
+                var vol: int64 := -1;
+                var cmd: int64 := 0;
+                var level: int64 := 0;
+
+                if ((what & 32) != 0) {
+                  note := S3MNote(peek8(data + q));
+                  instr := peek8(data + q + 1);
+                  q := q + 2;
+                }
+                if ((what & 64) != 0) {
+                  vol := peek8(data + q);
+                  q := q + 1;
+                }
+                if ((what & 128) != 0) {
+                  cmd := MapS3MEffect(peek8(data + q), peek8(data + q + 1), levelBox);
+                  level := peek64(levelBox);
+                  q := q + 2;
+                }
+
+                // Die Lautstaerkespalte hat in OctaMED keine Entsprechung;
+                // sie wird zu Command 0C. Ein echter Effekt in derselben
+                // Zelle hat Vorrang — er stuende sonst ohne Wirkung da.
+                if (vol >= 0) {
+                  if (cmd == 0) {
+                    cmd := 0x0C;
+                    level := vol;
+                    if (level > 64) { level := 64; }
+                  }
+                }
+
+                if (ch < channels) {
+                  b.PutCell(line, ch, CellPack(note, instr, cmd, level));
+                }
+              }
+            }
+          }
+          line := line + 1;
+        }
+      }
+    }
+
+    song.AddBlock(b);
+    pat := pat + 1;
+  }
+  free(levelBox, 8);
+
+  // ---- Orders -------------------------------------------------------------
+  // 254 ist ein Platzhalter, 255 das Ende der Liste. Beide gehoeren nicht in
+  // die Playing Sequence.
+  var seq: TPlaySeq := song.Seq();
+  var oi: int64 := 0;
+  while (oi < ordNum) {
+    var no: int64 := peek8(data + ordOff + oi);
+    if (no < 254) {
+      if (no < song.BlockCount) { seq.Add(no); }
+    }
+    oi := oi + 1;
+  }
+  if (seq.Len == 0) { seq.Add(0); }
+  if (song.BlockCount == 0) { song.AddBlock(NewBlock(channels, 64)); }
+
+  free(data, cap);
+  return song;
+}

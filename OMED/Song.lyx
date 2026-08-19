@@ -86,6 +86,12 @@ pub type TInstrument = class {
   SampleLen: int64;
   SampleRate: int64;    // Aufnahmerate aus dem 8SVX-Header, 0 = unbekannt
 
+  // Referenzrate des Samples (S3M: c2spd). Ist sie gesetzt, gibt sie die
+  // Tonhoehe vor statt der Amiga-Periodentabelle: Formate wie S3M stimmen
+  // ihre Instrumente ueber die Abspielrate, nicht ueber eine Notentabelle.
+  // 0 heisst "wie auf dem Amiga" und laesst alles beim Alten.
+  C2Rate: int64;
+
   fn Create(): void {
     self.Name := "";
     self.Volume := 64;
@@ -100,6 +106,7 @@ pub type TInstrument = class {
     self.SampleData := 0;
     self.SampleLen := 0;
     self.SampleRate := 0;
+    self.C2Rate := 0;
   }
 
   fn IsEmpty(): bool {
@@ -355,6 +362,10 @@ pub type TSong = class {
   BpmMode: bool;          // FLAG2_BPM
   EightChannel: bool;     // FLAG_8CHANNEL
 
+  // Stueck gehoert in den Software-Mixer, nicht auf die Paula. Gesetzt von
+  // Formaten, die nie fuer die Amiga-Hardware gedacht waren (S3M).
+  MixMode: bool;
+
   fn Create(name: pchar): void {
     self.Name := name;
     self.Blocks := new TObjectList();
@@ -372,6 +383,7 @@ pub type TSong = class {
     self.HexVolumes := true;
     self.BpmMode := false;
     self.EightChannel := false;
+    self.MixMode := false;
   }
 
   fn Destroy(): void {
