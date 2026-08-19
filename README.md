@@ -2,7 +2,7 @@
 
 ![status](https://img.shields.io/badge/status-working-brightgreen)
 ![language](https://img.shields.io/badge/language-Lyx-blue)
-![platform](https://img.shields.io/badge/platform-LyxOS%20%7C%20Linux%2FX11-lightgrey)
+![platform](https://img.shields.io/badge/platform-Linux%2FX11-lightgrey)
 ![formats](https://img.shields.io/badge/formats-MMD0%2F1%2F2%20%C2%B7%20MOD%20%C2%B7%20S3M-orange)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -54,10 +54,31 @@ where the mixer resolves 504.
 
 ## Requirements
 
-- `lyxc` — the Lyx compiler (tested with 1.1.2H)
+- `lyxc` — the Lyx compiler (tested with 1.1.3C)
 - `lpm` — the Lyx package manager, for fetching dependencies
 - The Lyx standard library (`aurum`), which ships with the compiler
 - X11 for the interface, ALSA for audio output (PipeWire works through its ALSA layer)
+
+### Platforms
+
+`lyxc` cross-compiles to Windows, macOS, ARM and more (`--target=win64`, `macosx64`,
+`macos-arm64`, `arm64`, `riscv`, `android-arm64`, `lyxos`, …), and plain Lyx programs do run
+there — a hello-world built with `--target=win64` runs fine under Wine.
+
+Paula itself does not, and the reason is not the compiler:
+
+| Platform | State |
+|---|---|
+| **Linux / X11** | Works. This is where it is developed and tested. |
+| **LyxOS** | Intended target. `--target=lyxos` currently fails in the compiler (`unknown builtin: alloc`). |
+| **Windows** | Builds, but does not run. The PE imports `KERNEL32.dll` only — no X11, no audio — and Wine rejects the resulting binary as a bad EXE. |
+| **macOS** | Builds a Mach-O with no dynamic libraries at all, so the same applies. |
+
+Two things are missing for those platforms, and both live outside this repository: Vega only
+ships an X11 and a null backend, so there is no window on Windows or macOS, and audio output
+goes through ALSA (`libasound.so.2`), which does not exist there either. Once Vega grows a
+Win32 or Cocoa backend, `OMED/Audio.lyx` is the single file that would need a second
+implementation.
 
 Vega is **not** vendored in this repository. It is a dependency, declared in `lyx.toml` and
 pinned in `lyx.lock`, and `lpm` fetches it.
@@ -87,7 +108,7 @@ lyxc paula.lyx -I /path/to/aurum -o paula
 
 `lpm list` shows what was resolved, `lpm info vega` details the package.
 
-For LyxOS, build as an ELF and stage it in `build.sh`, then launch from the compositor with
+On LyxOS, Paula is meant to be staged in `build.sh` and launched from the compositor with
 `SysSpawnAsync("/paula.elf"c)`. Audio there needs a VM with an AC97 controller:
 
 ```sh
