@@ -4,6 +4,7 @@
 ![language](https://img.shields.io/badge/language-Lyx-blue)
 ![platform](https://img.shields.io/badge/platform-LyxOS%20%7C%20Linux%2FX11-lightgrey)
 ![formats](https://img.shields.io/badge/formats-MMD0%2F1%2F2%20%C2%B7%20MOD-orange)
+![license](https://img.shields.io/badge/license-MIT-green)
 
 A music tracker for **LyxOS**, written in the **Lyx** language on the **Vega** VCL,
 modelled on **OctaMED Professional V5/V6** for the Commodore Amiga.
@@ -54,16 +55,37 @@ where the mixer resolves 504.
 ## Requirements
 
 - `lyxc` — the Lyx compiler (tested with 1.1.2H)
-- The **Vega** VCL, version 0.1.1 (declared in `lyx.toml`)
-- The Lyx standard library (`aurum`)
+- `lpm` — the Lyx package manager, for fetching dependencies
+- The Lyx standard library (`aurum`), which ships with the compiler
 - X11 for the interface, ALSA for audio output (PipeWire works through its ALSA layer)
+
+Vega is **not** vendored in this repository. It is a dependency, declared in `lyx.toml` and
+pinned in `lyx.lock`, and `lpm` fetches it.
+
+> **One patch is required.** Vega 0.1.1 declares the module variables `_active` and
+> `_activeApp` *after* the `TFileDialog` class that uses them, and `lyxc` allocates such a
+> variable twice — `Execute` writes to one, the handlers read the other. Confirming a file in
+> the open/save dialog then dereferences a null pointer and the program dies. Apply
+> [`patches/vega-0.1.1-filedlg-module-vars.patch`](patches/vega-0.1.1-filedlg-module-vars.patch)
+> to the fetched package (it simply moves the two declarations above the class), or avoid
+> *Load Song* and *Load Sample*.
 
 ## Building
 
 ```sh
+# 1. Install the Lyx compiler and lpm (see the Lyx distribution)
+
+# 2. Fetch the dependencies declared in lyx.toml — this resolves Vega 0.1.1
+lpm install
+
+# 3. Build
 lyxc paula.lyx -I /path/to/aurum -o paula
+
+# 4. Run
 ./paula
 ```
+
+`lpm list` shows what was resolved, `lpm info vega` details the package.
 
 For LyxOS, build as an ELF and stage it in `build.sh`, then launch from the compositor with
 `SysSpawnAsync("/paula.elf"c)`. Audio there needs a VM with an AC97 controller:
@@ -216,7 +238,7 @@ and open it with *Project → Load Song*.
 
 ## License
 
-Not yet chosen — all rights reserved for now. Open an issue if you need this settled.
+[MIT](LICENSE) — Copyright (c) 2026 Andreas Röne.
 
 ## Acknowledgements
 

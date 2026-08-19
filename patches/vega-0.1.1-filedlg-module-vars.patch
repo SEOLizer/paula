@@ -1,0 +1,37 @@
+--- /home/andreas/.lpm/cache/vega/0.1.1/FileDlg.lyx	2026-08-18 13:25:09.720847040 +0200
++++ VegaPatched/FileDlg.lyx	2026-08-18 21:23:13.548845485 +0200
+@@ -51,6 +51,20 @@
+ // Beide unterscheiden sich nur in Mode, Titel und der Frage, ob eine
+ // bestehende Datei ueberschrieben werden darf.
+ 
++// Der offene Dialog samt seiner Anwendung. Ein Dateidialog ist modal, es
++// kann also hoechstens einen geben. Die Anwendung liegt daneben, weil die
++// Handler sie fuer ShowMessage und ConfirmDlg brauchen und TForm keinen
++// Rueckverweis auf TApplication hat.
++//
++// Die Deklaration steht VOR der Klasse, obwohl sie inhaltlich zu den Handlern
++// darunter gehoert: lyxc legt eine Modulvariable, die erst nach ihrer ersten
++// Verwendung deklariert wird, zweimal an (Befund G in
++// lyx-gpi/ISSUE-lyxc-und-vega.md). Execute schrieb dann in die eine Variable
++// und die Handler lasen die andere — der Dialog lief in einen Nullzeiger,
++// sobald man eine Datei bestaetigte.
++var _active: TFileDialog;
++var _activeApp: TApplication;
++
+ pub type TFileDialog = class {
+   Mode: int64;
+   // Startverzeichnis. Leer heisst: das aktuelle Arbeitsverzeichnis.
+@@ -370,13 +384,6 @@
+   }
+ }
+ 
+-// Der offene Dialog samt seiner Anwendung. Ein Dateidialog ist modal, es
+-// kann also hoechstens einen geben. Die Anwendung liegt daneben, weil die
+-// Handler sie fuer ShowMessage und ConfirmDlg brauchen und TForm keinen
+-// Rueckverweis auf TApplication hat.
+-var _active: TFileDialog;
+-var _activeApp: TApplication;
+-
+ fn _IsParent(name: pchar): bool {
+   var p: int64 := name as int64;
+   if (peek8(p) != 46) { return false; }

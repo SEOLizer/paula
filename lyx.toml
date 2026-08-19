@@ -2,7 +2,7 @@
 name = "lyx-octaMED"
 version = "0.1.0"
 author = "Andreas Roene"
-license = ""
+license = "MIT"
 description = "Paula — OctaMED-artiger Music Tracker auf der Vega-VCL"
 
 [dependencies]
