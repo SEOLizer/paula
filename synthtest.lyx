@@ -1,0 +1,142 @@
+// synthtest.lyx — die erzeugten Instrumente nachrechnen: Wellenform, Pegel,
+// Schleifenpunkte. Ein Instrument, das nur Stille oder Vollausschlag liefert,
+// faellt hier auf, bevor es jemand hoert.
+import std.io;
+import std.audio;
+import OMED.Song;
+import OMED.Sample;
+import OMED.Synth;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintIntLn(v);
+}
+
+fn Check(label: pchar, got: int64, want: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintInt(got);
+  if (got == want) { PrintStrLn("  OK"); }
+  else { PrintStr("  ERWARTET "); PrintIntLn(want); }
+}
+
+fn Between(label: pchar, got: int64, lo: int64, hi: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintInt(got);
+  if (got >= lo) {
+    if (got <= hi) { PrintStrLn("  OK"); return; }
+  }
+  PrintStr("  ERWARTET ");
+  PrintInt(lo); PrintStr(".."); PrintIntLn(hi);
+}
+
+// Spitzenwert eines Samples.
+fn Peak(ins: TInstrument): int64 {
+  var p: int64 := 0;
+  var i: int64 := 0;
+  while (i < ins.SampleLen) {
+    var v: int64 := peek8(ins.SampleData + i);
+    if (v > 127) { v := v - 256; }
+    if (v < 0) { v := -v; }
+    if (v > p) { p := v; }
+    i := i + 1;
+  }
+  return p;
+}
+
+// Nulldurchgaenge: ein Mass fuer die Tonhoehe. Rauschen hat viele, ein
+// Grundton genau zwei je Schwingung.
+fn ZeroCrossings(ins: TInstrument): int64 {
+  var n: int64 := 0;
+  var vorher: int64 := 0;
+  var i: int64 := 0;
+  while (i < ins.SampleLen) {
+    var v: int64 := peek8(ins.SampleData + i);
+    if (v > 127) { v := v - 256; }
+    if (vorher < 0) {
+      if (v >= 0) { n := n + 1; }
+    }
+    vorher := v;
+    i := i + 1;
+  }
+  return n;
+}
+
+// Wie stark faellt die zweite Haelfte gegenueber der ersten ab? Fuer
+// Schlagwerk muss das deutlich sein.
+fn DecayRatio(ins: TInstrument): int64 {
+  var half: int64 := ins.SampleLen / 2;
+  var a: int64 := 0;
+  var b: int64 := 0;
+  var i: int64 := 0;
+  while (i < ins.SampleLen) {
+    var v: int64 := peek8(ins.SampleData + i);
+    if (v > 127) { v := v - 256; }
+    if (v < 0) { v := -v; }
+    if (i < half) { if (v > a) { a := v; } }
+    else { if (v > b) { b := v; } }
+    i := i + 1;
+  }
+  if (a == 0) { return 0; }
+  return (b * 100) / a;
+}
+
+fn main(): int64 {
+  // Sinusnaeherung: Nulldurchgaenge und Extremwerte muessen stimmen.
+  Check("sin(0)", SinQ(0), 0);
+  Between("sin(256) = maximum", SinQ(256), 1000, 1024);
+  Check("sin(512)", SinQ(512), 0);
+  Between("sin(768) = minimum", SinQ(768), 0 - 1024, 0 - 1000);
+
+  // Rauschregister: darf nicht stehenbleiben und nicht sofort wiederkehren.
+  var s1: int64 := NoiseNext(0xACE1);
+  var s2: int64 := NoiseNext(s1);
+  var gleich: int64 := 0;
+  if (s1 == s2) { gleich := 1; }
+  Check("rauschen laeuft weiter", gleich, 0);
+
+  var bass: TInstrument := NewInstrument("Bass");
+  MakeDefaultBass(bass);
+  Show("bass laenge", bass.SampleLen);
+  Between("bass spitzenwert", Peak(bass), 60, 127);
+  Between("bass nulldurchgaenge", ZeroCrossings(bass), 20, 28);
+  Check("bass hat schleife", (bass.RepeatLen > 0) as int64, 1);
+
+  var lead: TInstrument := NewInstrument("Lead");
+  MakeDefaultLead(lead);
+  Between("lead nulldurchgaenge", ZeroCrossings(lead), 20, 28);
+  Check("lead hat schleife", (lead.RepeatLen > 0) as int64, 1);
+
+  var pad: TInstrument := NewInstrument("Pad");
+  MakeDefaultPad(pad);
+  Between("pad spitzenwert", Peak(pad), 40, 127);
+  Check("pad hat schleife", (pad.RepeatLen > 0) as int64, 1);
+
+  var saite: TInstrument := NewInstrument("String");
+  MakeDefaultString(saite);
+  Between("saite spitzenwert", Peak(saite), 60, 127);
+  // Die Saite klingt aus: hinten deutlich leiser als vorn.
+  Between("saite abklingen in prozent", DecayRatio(saite), 1, 60);
+
+  var kick: TInstrument := NewInstrument("Kick");
+  MakeDefaultKick(kick);
+  Between("kick spitzenwert", Peak(kick), 60, 127);
+  Between("kick abklingen in prozent", DecayRatio(kick), 1, 40);
+
+  var snare: TInstrument := NewInstrument("Snare");
+  MakeDefaultSnare(snare);
+  Between("snare spitzenwert", Peak(snare), 50, 127);
+  Between("snare abklingen in prozent", DecayRatio(snare), 1, 60);
+
+  var chh: TInstrument := NewInstrument("Closed Hat");
+  MakeDefaultClosedHat(chh);
+  var ohh: TInstrument := NewInstrument("Open Hat");
+  MakeDefaultOpenHat(ohh);
+  Show("geschlossene hi-hat laenge", chh.SampleLen);
+  Show("offene hi-hat laenge", ohh.SampleLen);
+  Check("offene hi-hat ist laenger", (ohh.SampleLen > chh.SampleLen) as int64, 1);
+
+  // Rauschen hat viele Nulldurchgaenge, ein Grundton wenige — so trennt sich
+  // Schlagwerk von Melodieinstrumenten nachweisbar.
+  Show("hi-hat nulldurchgaenge", ZeroCrossings(chh));
+  Check("hi-hat rauscht mehr als der bass",
+        (ZeroCrossings(chh) > ZeroCrossings(bass)) as int64, 1);
+
+  return 0;
+}
