@@ -1,0 +1,428 @@
+// OMED/XM.lyx — FastTracker-2-Module lesen.
+//
+// XM ist das aufwendigste der hier gelesenen Formate. Es bringt Dinge mit, die
+// es in MMD, MOD und S3M nicht gibt:
+//
+//   * INSTRUMENTE mit mehreren Samples und einer Zuordnung Note -> Sample,
+//   * HUELLKURVEN fuer Lautstaerke und Panorama,
+//   * DELTA-KODIERTE Sampledaten: gespeichert ist die Differenz zum
+//     Vorgaenger, nicht der Wert. Wer das uebersieht, bekommt Rauschen.
+//   * Patterns mit beliebiger Zeilenzahl (haeufig 48 oder 64),
+//   * gepackte Zellen: ein gesetztes oberstes Bit im ersten Byte sagt,
+//     welche der fuenf Spalten ueberhaupt folgen.
+//
+// Was hier ankommt, ist das Wesentliche: Noten, Instrumente, Effekte und je
+// Instrument das ERSTE Sample. Huellkurven, Notenzuordnung und Panorama
+// bleiben aussen vor — dafuer hat das Datenmodell dieses Trackers keinen
+// Platz, und geraten waere schlimmer als weggelassen.
+//
+// Aufbau:
+//   0x00 "Extended Module: ", 0x11 Name[20], 0x25 0x1A, 0x26 Tracker[20]
+//   0x3A Version, 0x3C Kopflaenge (ab hier gezaehlt)
+//   0x40 Songlaenge, 0x42 Restart, 0x44 Kanaele, 0x46 Patterns,
+//   0x48 Instrumente, 0x4A Flags (Bit 0: 0 = Amiga, 1 = lineare Tabelle),
+//   0x4C Speed (Ticks je Line), 0x4E BPM, 0x50 Ordertabelle[256]
+
+@description("OctaMED-Tracker - FastTracker-2-Module lesen")
+@author("Andreas Roene")
+unit OMED.XM;
+
+import std.fs;
+import OMED.Song;
+
+pub con XM_MAX_FILE: int64 := 32 * 1024 * 1024;
+
+fn U16(p: int64): int64 {
+  return peek8(p) | (peek8(p + 1) << 8);
+}
+
+fn U32(p: int64): int64 {
+  return peek8(p) | (peek8(p + 1) << 8) | (peek8(p + 2) << 16) | (peek8(p + 3) << 24);
+}
+
+fn I8(p: int64): int64 {
+  var v: int64 := peek8(p);
+  if (v > 127) { return v - 256; }
+  return v;
+}
+
+fn CopyText(src: int64, maxLen: int64): pchar {
+  var len: int64 := maxLen;
+  // Namen in XM sind mit Leerzeichen aufgefuellt, nicht nullterminiert.
+  while (len > 0) {
+    var c: int64 := peek8(src + len - 1);
+    if (c == 0) { len := len - 1; }
+    else {
+      if (c == 32) { len := len - 1; }
+      else { len := 0 - len; }
+    }
+  }
+  if (len < 0) { len := -len; }
+
+  var dst: int64 := alloc(len + 1);
+  var i: int64 := 0;
+  while (i < len) {
+    var c2: int64 := peek8(src + i);
+    if (c2 == 0) { c2 := 32; }
+    poke8(dst + i, c2);
+    i := i + 1;
+  }
+  poke8(dst + len, 0);
+  return dst as pchar;
+}
+
+// XM zaehlt Noten ab C-0 = 1, wir ab C-1 = 1. Der Bezugspunkt ist wieder die
+// Rate: ein Sample mit relativer Note 0 spielt bei XM das C-4 mit 8363 Hz,
+// und das ist auf dem Amiga die Periode 428 — unser C-2 (Notennummer 13).
+// XM-Note 49 muss also auf 13 fallen, der Versatz betraegt 36.
+pub con XM_NOTE_OFFSET: int64 := 36;
+pub con XM_KEY_OFF: int64 := 97;
+
+pub fn XMNote(b: int64): int64 {
+  if (b < 1) { return 0; }
+  if (b >= XM_KEY_OFF) { return 0; }
+  var note: int64 := b - XM_NOTE_OFFSET;
+  if (note < 1) { return 1; }
+  if (note > 72) { return 72; }
+  return note;
+}
+
+// ---- Effekte ---------------------------------------------------------------
+// XM zaehlt wie ProTracker (0..F) und haengt eigene Nummern an (G..Z als
+// 16..35). Was keine Entsprechung hat, wird verworfen.
+pub fn MapXMEffect(fx: int64, param: int64, levelOut: int64): int64 {
+  poke64(levelOut, param);
+
+  if (fx == 0x0) { return 0x00; }        // Arpeggio
+  if (fx == 0x1) { return 0x01; }        // Porta hoch
+  if (fx == 0x2) { return 0x02; }        // Porta runter
+  if (fx == 0x3) { return 0x03; }        // Tone Portamento
+  if (fx == 0x4) { return 0x04; }        // Vibrato
+  if (fx == 0x5) { return 0x05; }        // Tone Porta + Volume Slide
+  if (fx == 0x6) { return 0x06; }        // Vibrato + Volume Slide
+  if (fx == 0x7) { return 0x07; }        // Tremolo
+  if (fx == 0x9) { return 0x19; }        // Sample Offset
+  if (fx == 0xA) { return 0x0D; }        // Volume Slide
+  if (fx == 0xB) { return 0x0B; }        // Position Jump
+  if (fx == 0xC) { return 0x0C; }        // Set Volume
+  if (fx == 0xD) { return 0x1D; }        // Pattern Break
+  if (fx == 0xF) {
+    if (param < 0x20) { return 0x09; }   // Ticks je Line
+    return 0x0F;                         // Tempo
+  }
+  if (fx == 0x11) { return 0x0D; }       // H: Global Volume Slide, naeherungsweise
+  if (fx == 0x19) { return 0x0D; }       // P: Panning Slide -> nichts Besseres da
+  if (fx == 0x1B) {                      // R: Retrigger
+    poke64(levelOut, param & 0x0F);
+    return 0x1F;
+  }
+
+  if (fx == 0xE) {                       // Erweiterte Befehle im oberen Nibble
+    var sub: int64 := (param >> 4) & 0x0F;
+    var val: int64 := param & 0x0F;
+    poke64(levelOut, val);
+    if (sub == 0x1) { return 0x11; }     // Feines Porta hoch
+    if (sub == 0x2) { return 0x12; }     // Feines Porta runter
+    if (sub == 0x5) { return 0x15; }     // Finetune setzen
+    if (sub == 0x6) { return 0x16; }     // Pattern Loop
+    if (sub == 0x9) { return 0x1F; }     // Retrigger
+    if (sub == 0xA) { return 0x1A; }     // Feines Volume hoch
+    if (sub == 0xB) { return 0x1B; }     // Feines Volume runter
+    if (sub == 0xC) { return 0x18; }     // Note Cut
+    if (sub == 0xD) { poke64(levelOut, val << 4); return 0x1F; }   // Note Delay
+    if (sub == 0xE) { return 0x1E; }     // Pattern Delay
+  }
+
+  poke64(levelOut, 0);
+  return 0x00;
+}
+
+// Die Lautstaerkespalte traegt zweierlei: 0x10..0x50 ist ein Wert von 0..64,
+// alles darueber sind eigene Befehle (Slides, Vibrato, Panorama). Nur der
+// Wertebereich laesst sich sinnvoll uebernehmen.
+pub fn XMVolumeColumn(v: int64): int64 {
+  if (v < 0x10) { return -1; }
+  if (v > 0x50) { return -1; }
+  return v - 0x10;
+}
+
+// ---- Laden -----------------------------------------------------------------
+
+// Die Kennung ist "Extended Module: " — siebzehn Zeichen einschliesslich des
+// Leerzeichens am Ende. Sie wird vollstaendig verglichen: eine Stichprobe an
+// einzelnen Stellen hatte hier schon einmal danebengegriffen, weil das 'M'
+// von "Module" an Position 9 steht und nicht an 8.
+fn XMTagAt(p: int64): bool {
+  var tag: pchar := "Extended Module: ";
+  var t: int64 := tag as int64;
+  var i: int64 := 0;
+  while (i < 17) {
+    if (peek8(p + i) != peek8(t + i)) { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+pub fn IsXM(path: pchar): bool {
+  var buf: int64 := alloc(20);
+  if (buf == 0) { return false; }
+  var n: int64 := ReadFile(path, buf as pchar, 17);
+  var ok: bool := false;
+  if (n >= 17) { ok := XMTagAt(buf); }
+  free(buf, 20);
+  return ok;
+}
+
+pub fn LoadXM(path: pchar): TSong {
+  var cap: int64 := XM_MAX_FILE;
+  var data: int64 := alloc(cap);
+  if (data == 0) { return null; }
+  var size: int64 := ReadFile(path, data as pchar, cap);
+  if (size < 336) {
+    free(data, cap);
+    return null;
+  }
+  if (!XMTagAt(data)) {
+    free(data, cap);
+    return null;
+  }
+
+  var headerLen: int64 := U32(data + 0x3C);
+  var songLen: int64 := U16(data + 0x40);
+  var channels: int64 := U16(data + 0x44);
+  var patNum: int64 := U16(data + 0x46);
+  var insNum: int64 := U16(data + 0x48);
+  var speed: int64 := U16(data + 0x4C);
+  var bpm: int64 := U16(data + 0x4E);
+
+  if (channels < 1) {
+    free(data, cap);
+    return null;
+  }
+  if (channels > OM_MAX_TRACKS) { channels := OM_MAX_TRACKS; }
+
+  var song: TSong := NewSong(CopyText(data + 0x11, 20));
+  if (bpm > 0) { song.Tempo := bpm; }
+  if (speed > 0) { song.Tpl := speed; }
+  song.Lpb := 4;
+
+  // Wie S3M ist auch XM kein Amiga-Format: acht und mehr Spuren mit eigenen
+  // Instrumentstimmungen gehoeren in den Mixer, nicht auf die Paula.
+  song.MixMode := true;
+
+  // ---- Patterns -----------------------------------------------------------
+  var levelBox: int64 := alloc(8);
+  var off: int64 := 0x3C + headerLen;
+  var pat: int64 := 0;
+  while (pat < patNum) {
+    if (off + 9 > size) { pat := patNum; }
+    else {
+      var patHdr: int64 := U32(data + off);
+      var rows: int64 := U16(data + off + 5);
+      var packed: int64 := U16(data + off + 7);
+      if (rows < 1) { rows := 64; }
+      if (rows > OM_MAX_LINES) { rows := OM_MAX_LINES; }
+
+      var b: TBlock := NewBlock(channels, rows);
+      var q: int64 := off + patHdr;
+      var ende: int64 := q + packed;
+      if (ende > size) { ende := size; }
+
+      // Ein Pattern ohne gepackte Daten ist leer — das ist erlaubt und
+      // spart in vielen Modulen den groessten Teil der Datei.
+      if (packed > 0) {
+        var line: int64 := 0;
+        while (line < rows) {
+          var ch: int64 := 0;
+          while (ch < channels) {
+            if (q >= ende) { ch := channels; }
+            else {
+              var note: int64 := 0;
+              var instr: int64 := 0;
+              var vol: int64 := 0;
+              var fx: int64 := 0;
+              var param: int64 := 0;
+
+              var first: int64 := peek8(data + q);
+              q := q + 1;
+              if ((first & 0x80) != 0) {
+                // Gepackt: nur die angekreuzten Spalten stehen da.
+                var mask: int64 := first & 0x7F;
+                if ((mask & 1) != 0) { note := peek8(data + q); q := q + 1; }
+                if ((mask & 2) != 0) { instr := peek8(data + q); q := q + 1; }
+                if ((mask & 4) != 0) { vol := peek8(data + q); q := q + 1; }
+                if ((mask & 8) != 0) { fx := peek8(data + q); q := q + 1; }
+                if ((mask & 16) != 0) { param := peek8(data + q); q := q + 1; }
+              } else {
+                // Ungepackt: das erste Byte IST die Note, alle fuenf folgen.
+                note := first;
+                instr := peek8(data + q);
+                vol := peek8(data + q + 1);
+                fx := peek8(data + q + 2);
+                param := peek8(data + q + 3);
+                q := q + 4;
+              }
+
+              var cmd: int64 := MapXMEffect(fx, param, levelBox);
+              var level: int64 := peek64(levelBox);
+
+              // Lautstaerkespalte nur uebernehmen, wenn kein echter Effekt
+              // in derselben Zelle steht — sonst ginge dieser verloren.
+              if (cmd == 0) {
+                var vc: int64 := XMVolumeColumn(vol);
+                if (vc >= 0) {
+                  cmd := 0x0C;
+                  level := vc;
+                }
+              }
+
+              b.PutCell(line, ch, CellPack(XMNote(note), instr, cmd, level));
+              ch := ch + 1;
+            }
+          }
+          line := line + 1;
+        }
+      }
+
+      song.AddBlock(b);
+      off := off + patHdr + packed;
+      pat := pat + 1;
+    }
+  }
+  free(levelBox, 8);
+
+  // ---- Instrumente --------------------------------------------------------
+  // Jedes Instrument bringt seinen eigenen Kopf mit variabler Laenge mit —
+  // die Laenge steht im ersten Langwort und MUSS benutzt werden, weil
+  // verschiedene Tracker unterschiedlich viel hineinschreiben.
+  var i: int64 := 0;
+  while (i < insNum) {
+    if (off + 4 > size) { i := insNum; }
+    else {
+      var insHdr: int64 := U32(data + off);
+      if (insHdr < 4) { insHdr := 4; }
+      var ins: TInstrument := NewInstrument(CopyText(data + off + 4, 22));
+
+      var numSamples: int64 := 0;
+      if (off + 29 <= size) { numSamples := U16(data + off + 27); }
+
+      var next: int64 := off + insHdr;
+      if (numSamples > 0) {
+        var smpHdrSize: int64 := U32(data + off + 29);
+        if (smpHdrSize < 40) { smpHdrSize := 40; }
+
+        // Die Sampleköpfe stehen hintereinander, danach ihre Daten. Gelesen
+        // wird nur das erste Sample: unser Instrument hat genau eines.
+        var smpHdr: int64 := next;
+        var len: int64 := 0;
+        var loopStart: int64 := 0;
+        var loopLen: int64 := 0;
+        var typ: int64 := 0;
+
+        if (smpHdr + 40 <= size) {
+          len := U32(data + smpHdr);
+          loopStart := U32(data + smpHdr + 4);
+          loopLen := U32(data + smpHdr + 8);
+          ins.Volume := peek8(data + smpHdr + 12);
+          if (ins.Volume > 64) { ins.Volume := 64; }
+          // Finetune ist in XM feiner aufgeloest (-128..127) als bei uns.
+          ins.FineTune := I8(data + smpHdr + 13) / 16;
+          typ := peek8(data + smpHdr + 14);
+          // Die relative Note verschiebt das ganze Instrument — dafuer gibt
+          // es Transpose, und die Engine addiert es ohnehin auf jede Note.
+          ins.Transpose := I8(data + smpHdr + 16);
+        }
+
+        // Datenanfang: hinter allen Sampleköpfen dieses Instruments.
+        var dataOff: int64 := next + (numSamples * smpHdrSize);
+        var bits16: bool := (typ & 16) != 0;
+
+        if (len > 0) {
+          if (dataOff + len <= size) {
+            var count: int64 := len;
+            if (bits16) { count := len / 2; }
+            var dst: int64 := alloc(count);
+            if (dst != 0) {
+              // Delta-Dekodierung: gespeichert ist die Differenz zum
+              // Vorgaenger. Ohne diesen Schritt klingt jedes Sample wie
+              // Rauschen — der haeufigste Fehler beim Lesen von XM.
+              var alt: int64 := 0;
+              var k: int64 := 0;
+              while (k < count) {
+                if (bits16) {
+                  var d16: int64 := U16(data + dataOff + (k * 2));
+                  if (d16 > 32767) { d16 := d16 - 65536; }
+                  alt := alt + d16;
+                  if (alt > 32767) { alt := alt - 65536; }
+                  if (alt < 0 - 32768) { alt := alt + 65536; }
+                  // 16 Bit auf 8 herunterbringen: das Backend kennt nur
+                  // Bytes. Verlust ja, aber ein Instrument weniger waere
+                  // schlimmer.
+                  poke8(dst + k, (alt / 256) & 0xFF);
+                } else {
+                  var d8: int64 := peek8(data + dataOff + k);
+                  if (d8 > 127) { d8 := d8 - 256; }
+                  alt := (alt + d8) & 0xFF;
+                  if (alt > 127) { alt := alt - 256; }
+                  poke8(dst + k, alt & 0xFF);
+                }
+                k := k + 1;
+              }
+              ins.SampleData := dst;
+              ins.SampleLen := count;
+              ins.SampleRate := 8363;
+
+              // Schleife nur, wenn der Typ sie vorsieht. Ping-Pong (Bit 1)
+              // kann das Backend nicht, wird also als gewoehnliche Schleife
+              // gespielt.
+              if ((typ & 3) != 0) {
+                if (loopLen > 0) {
+                  var ls: int64 := loopStart;
+                  var ll: int64 := loopLen;
+                  if (bits16) {
+                    ls := ls / 2;
+                    ll := ll / 2;
+                  }
+                  ins.RepeatStart := ls / 2;
+                  ins.RepeatLen := ll / 2;
+                }
+              }
+            }
+          }
+        }
+
+        // Weiter hinter Sampleköpfen UND Sampledaten aller Samples dieses
+        // Instruments — auch der ungelesenen.
+        var alleDaten: int64 := 0;
+        var sIdx: int64 := 0;
+        while (sIdx < numSamples) {
+          var hdr: int64 := next + (sIdx * smpHdrSize);
+          if (hdr + 4 <= size) { alleDaten := alleDaten + U32(data + hdr); }
+          sIdx := sIdx + 1;
+        }
+        next := next + (numSamples * smpHdrSize) + alleDaten;
+      }
+
+      song.AddInstrument(ins);
+      off := next;
+      i := i + 1;
+    }
+  }
+
+  // ---- Ordertabelle -------------------------------------------------------
+  var seq: TPlaySeq := song.Seq();
+  var oi: int64 := 0;
+  while (oi < songLen) {
+    if (oi >= 256) { oi := songLen; }
+    else {
+      var no: int64 := peek8(data + 0x50 + oi);
+      if (no < song.BlockCount) { seq.Add(no); }
+      oi := oi + 1;
+    }
+  }
+  if (seq.Len == 0) { seq.Add(0); }
+  if (song.BlockCount == 0) { song.AddBlock(NewBlock(channels, 64)); }
+
+  free(data, cap);
+  return song;
+}

@@ -1,0 +1,136 @@
+// xmtest.lyx — Pruefprogramm fuer den XM-Import.
+import std.io;
+import OMED.Song;
+import OMED.XM;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintIntLn(v);
+}
+
+fn Check(label: pchar, got: int64, want: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintInt(got);
+  if (got == want) { PrintStrLn("  OK"); }
+  else { PrintStr("  ERWARTET "); PrintIntLn(want); }
+}
+
+fn Between(label: pchar, got: int64, lo: int64, hi: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintInt(got);
+  if (got >= lo) {
+    if (got <= hi) { PrintStrLn("  OK"); return; }
+  }
+  PrintStr("  ERWARTET "); PrintInt(lo); PrintStr(".."); PrintIntLn(hi);
+}
+
+fn main(): int64 {
+  // Notenumrechnung: XM zaehlt ab C-0 = 1, die Referenz C-4 (49) ist unser
+  // C-2 (13).
+  Check("XM C-4 -> C-2", XMNote(49), 13);
+  Check("XM C-5 -> C-3", XMNote(61), 25);
+  Check("XM H-4", XMNote(60), 24);
+  Check("key off", XMNote(97), 0);
+  Check("leere zelle", XMNote(0), 0);
+
+  // Lautstaerkespalte: nur 0x10..0x50 sind Werte.
+  Check("volumespalte 0x10", XMVolumeColumn(0x10), 0);
+  Check("volumespalte 0x50", XMVolumeColumn(0x50), 64);
+  Check("volumespalte 0x60 ist ein befehl", XMVolumeColumn(0x60), 0 - 1);
+
+  // Erst die Erkennung, dann das Laden — genau in dieser Reihenfolge macht es
+  // auch das Programm. Ein Test, der nur LoadXM aufruft, uebersieht einen
+  // Fehler in IsXM vollstaendig; genau das ist hier passiert.
+  Check("datei wird als XM erkannt",
+        IsXM("/home/andreas/PhpstormProjects/lyx-octaMED/x-files2.xm") as int64, 1);
+  Check("fremde datei wird abgelehnt",
+        IsXM("/home/andreas/PhpstormProjects/lyx-octaMED/README.md") as int64, 0);
+
+  var song: TSong := LoadXM("/home/andreas/PhpstormProjects/lyx-octaMED/x-files2.xm");
+  if (song == null) { PrintStrLn("NICHT GELADEN"); return 1; }
+
+  PrintStr("titel: "); PrintStrLn(song.Name);
+  Check("blocks", song.BlockCount, 26);
+  Check("instrumente", song.InstrCount, 17);
+  Check("tracks", song.BlockAt(0).Tracks, 8);
+  Check("lines in block 0", song.BlockAt(0).Lines, 48);
+  Check("tempo", song.Tempo, 132);
+  Check("tpl", song.Tpl, 6);
+  Check("sequenzlaenge", song.SeqLen(), 56);
+  Check("mix-modus", song.MixMode as int64, 1);
+
+  var noten: int64 := 0;
+  var mitCmd: int64 := 0;
+  var amRand: int64 := 0;
+  var bi: int64 := 0;
+  while (bi < song.BlockCount) {
+    var b: TBlock := song.BlockAt(bi);
+    var l: int64 := 0;
+    while (l < b.Lines) {
+      var t: int64 := 0;
+      while (t < b.Tracks) {
+        var c: int64 := b.Cell(l, t);
+        if (CellNote(c) > 0) {
+          noten := noten + 1;
+          if (CellNote(c) >= 72) { amRand := amRand + 1; }
+        }
+        if (CellCmd(c) > 0) { mitCmd := mitCmd + 1; }
+        t := t + 1;
+      }
+      l := l + 1;
+    }
+    bi := bi + 1;
+  }
+  Show("zellen mit note", noten);
+  Show("zellen mit command", mitCmd);
+  Check("noten am oberen rand", amRand, 0);
+
+  // Samples: delta-dekodiert. Ein falsch gelesenes Sample erkennt man daran,
+  // dass benachbarte Werte wild springen — echte Klaenge sind stetiger.
+  var mitSample: int64 := 0;
+  var spruenge: int64 := 0;
+  var werte: int64 := 0;
+  var i: int64 := 1;
+  while (i <= song.InstrCount) {
+    var ins: TInstrument := song.Instrument(i);
+    if (ins != null) {
+      if (ins.SampleLen > 0) {
+        mitSample := mitSample + 1;
+        if (mitSample <= 5) {
+          PrintStr("  ");
+          PrintStr(ins.Name);
+          PrintStr("  len=");
+          PrintInt(ins.SampleLen);
+          PrintStr(" vol=");
+          PrintInt(ins.Volume);
+          PrintStr(" transpose=");
+          PrintInt(ins.Transpose);
+          PrintStr(" rep=");
+          PrintInt(ins.RepeatStart);
+          PrintStr("/");
+          PrintIntLn(ins.RepeatLen);
+        }
+
+        var k: int64 := 1;
+        var grenze: int64 := ins.SampleLen;
+        if (grenze > 2000) { grenze := 2000; }
+        while (k < grenze) {
+          var a: int64 := peek8(ins.SampleData + k - 1);
+          var b2: int64 := peek8(ins.SampleData + k);
+          if (a > 127) { a := a - 256; }
+          if (b2 > 127) { b2 := b2 - 256; }
+          var d: int64 := b2 - a;
+          if (d < 0) { d := -d; }
+          if (d > 100) { spruenge := spruenge + 1; }
+          werte := werte + 1;
+          k := k + 1;
+        }
+      }
+    }
+    i := i + 1;
+  }
+  Show("instrumente mit sample", mitSample);
+  Show("geprüfte samplewerte", werte);
+  Show("harte spruenge", spruenge);
+  // Rauschen haette bei jedem zweiten Wert einen harten Sprung; echte
+  // Klaenge liegen weit darunter.
+  Between("anteil harte spruenge in prozent", (spruenge * 100) / werte, 0, 15);
+  return 0;
+}

@@ -39,6 +39,7 @@ import OMED.Dialogs;
 import OMED.MMD;
 import OMED.MOD;
 import OMED.S3M;
+import OMED.XM;
 import std.fs;
 
 con WIN_W: int64 := 720;
@@ -474,15 +475,20 @@ fn ActLoadSong(sender: TControl): void {
     dlg.FullPath(path);
     // Format am Inhalt erkennen, nicht an der Endung. MOD traegt seine
     // Kennung bei Byte 1080, MMD am Anfang — beide sagen es also selbst.
+    // Jedes Format traegt seine Kennung an anderer Stelle, also fragt jeder
+    // Leser selbst, ob die Datei zu ihm gehoert.
     var loaded: TSong := null;
-    if (IsS3M(path.AsPChar())) { loaded := LoadS3M(path.AsPChar()); }
+    if (IsXM(path.AsPChar())) { loaded := LoadXM(path.AsPChar()); }
     else {
-      if (IsMOD(path.AsPChar())) { loaded := LoadMOD(path.AsPChar()); }
-      else { loaded := LoadMMD(path.AsPChar()); }
+      if (IsS3M(path.AsPChar())) { loaded := LoadS3M(path.AsPChar()); }
+      else {
+        if (IsMOD(path.AsPChar())) { loaded := LoadMOD(path.AsPChar()); }
+        else { loaded := LoadMMD(path.AsPChar()); }
+      }
     }
 
     if (loaded == null) {
-      PrintStrLn("Paula: kein lesbares Modul (MMD0/1/2, MOD oder S3M)");
+      PrintStrLn("Paula: kein lesbares Modul (MMD0/1/2, MOD, S3M oder XM)");
     } else {
       // Der geladene Modus gehoert zum Song: FLAG_8CHANNEL entscheidet in
       // AdoptSong, mit welchem Backend das Stueck klingen soll.
