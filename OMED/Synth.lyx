@@ -1,0 +1,356 @@
+// OMED/Synth.lyx — Instrumente aus dem Nichts.
+//
+// Ein Tracker ohne Samples ist stumm. Bis hierher sprang eine Rechteck-
+// schwingung ein, und die klingt genau danach: hart, schrill und bei hohen
+// Noten voller Aliasing, weil ihre Oberwellen nicht enden.
+//
+// Diese Unit erzeugt brauchbare Instrumente rechnerisch. Drei Verfahren, alle
+// in Ganzzahlarithmetik:
+//
+//   ADDITIV      Grundton plus einzeln dosierte Oberwellen. Wer nur so viele
+//                Oberwellen addiert, wie unterhalb der halben Abtastrate
+//                liegen, bekommt einen Saegezahn oder eine Orgel OHNE das
+//                Aliasing der harten Kante.
+//   RAUSCHEN     Ein rueckgekoppeltes Schieberegister, wie es die Klangchips
+//                jener Zeit hatten. Grundlage fuer Schlagwerk.
+//   KARPLUS-STRONG  Rauschen in eine Verzoegerungsschleife, je Durchlauf
+//                gemittelt. Aus Zufall wird eine gezupfte Saite — der beste
+//                Klang je Zeile Code, den die Synthese kennt.
+//
+// Alles bleibt 8 Bit und mono, weil das Backend nichts anderes annimmt.
+
+@description("OctaMED-Tracker - Instrumente rechnerisch erzeugen")
+@author("Andreas Roene")
+unit OMED.Synth;
+
+import OMED.Song;
+import OMED.Sample;
+
+// ---- Grundlagen ------------------------------------------------------------
+
+// Sinus ohne Gleitkomma und ohne Tabelle: die Parabelnaeherung von Bhaskara.
+// Phase 0..1023 entspricht einer vollen Schwingung, Rueckgabe -1024..1024.
+// Der Fehler liegt unter einem Prozent — fuer 8-Bit-Ausgabe weit genug.
+pub fn SinQ(phase: int64): int64 {
+  var p: int64 := phase % 1024;
+  if (p < 0) { p := p + 1024; }
+
+  var neg: bool := false;
+  if (p >= 512) {
+    p := p - 512;
+    neg := true;
+  }
+
+  // In Grad gerechnet: 4x(180-x) / (40500 - x(180-x))
+  var x: int64 := (p * 180) / 512;
+  var t: int64 := x * (180 - x);
+  var v: int64 := (4 * t * 1024) / (40500 - t);
+  if (v > 1024) { v := 1024; }
+  if (neg) { return -v; }
+  return v;
+}
+
+// Lineares Rueckkopplungsregister, 16 Bit, Taps wie im klassischen Chiptune-
+// Rauschen. Der Zustand wird vom Aufrufer gehalten, damit zwei Instrumente
+// nicht dasselbe Rauschen bekommen.
+pub fn NoiseNext(state: int64): int64 {
+  var s: int64 := state & 0xFFFF;
+  if (s == 0) { s := 0xACE1; }
+  var bit: int64 := ((s >> 0) ^ (s >> 2) ^ (s >> 3) ^ (s >> 5)) & 1;
+  return ((s >> 1) | (bit << 15)) & 0xFFFF;
+}
+
+// Ein Wert -128..127 in den Puffer, als Byte.
+fn PutSample(data: int64, i: int64, v: int64): void {
+  var x: int64 := v;
+  if (x > 127) { x := 127; }
+  if (x < -128) { x := -128; }
+  if (x < 0) { x := x + 256; }
+  poke8(data + i, x & 0xFF);
+}
+
+// Sample an ein Instrument haengen und die Schleife setzen. Schleifenwerte in
+// Worten, wie die Paula-Register sie erwarten; 0 heisst keine Schleife.
+fn Attach(ins: TInstrument, data: int64, len: int64,
+          loopStart: int64, loopLen: int64): void {
+  if (ins.SampleData != 0) { free(ins.SampleData, ins.SampleLen); }
+  ins.SampleData := data;
+  ins.SampleLen := len;
+  ins.SampleRate := OM_DEFAULT_RATE;
+  ins.C2Rate := 0;
+  ins.RepeatStart := loopStart / 2;
+  ins.RepeatLen := loopLen / 2;
+}
+
+// ---- Additive Klaenge ------------------------------------------------------
+// Der Klang entsteht aus Grundton und Oberwellen. Welche Oberwellen wie stark
+// dabei sind, macht den Unterschied zwischen Saegezahn, Orgel und Klarinette:
+//
+//   alle Oberwellen, Staerke 1/n      -> Saegezahn, hell und voll
+//   nur ungerade, Staerke 1/n         -> Rechteck, hohl
+//   nur ungerade, Staerke 1/n²        -> Dreieck, weich
+//
+// Entscheidend ist die Obergrenze: nur Oberwellen unterhalb der halben
+// Abtastrate duerfen mit. Deshalb klingt das hier sauber, wo eine gezeichnete
+// Rechteckflanke kratzt.
+pub fn MakeAdditiveSample(ins: TInstrument, cycleLen: int64, cycles: int64,
+                          harmonics: int64, oddOnly: bool,
+                          slope: int64): bool {
+  if (ins == null) { return false; }
+  var cyc: int64 := cycleLen;
+  if (cyc < 8) { cyc := 8; }
+  var n: int64 := cycles;
+  if (n < 2) { n := 2; }
+  var len: int64 := cyc * n;
+
+  // Mehr Oberwellen, als in eine Schwingung passen, waeren Aliasing.
+  var maxH: int64 := cyc / 2;
+  var h: int64 := harmonics;
+  if (h < 1) { h := 1; }
+  if (h > maxH) { h := maxH; }
+
+  var data: int64 := alloc(len);
+  if (data == 0) { return false; }
+
+  var i: int64 := 0;
+  while (i < len) {
+    var phase: int64 := (i % cyc) * 1024 / cyc;
+    var sum: int64 := 0;
+    var k: int64 := 1;
+    while (k <= h) {
+      var nimm: bool := true;
+      if (oddOnly) {
+        if ((k % 2) == 0) { nimm := false; }
+      }
+      if (nimm) {
+        var amp: int64 := 1000 / k;
+        if (slope == 2) { amp := 1000 / (k * k); }
+        sum := sum + ((SinQ(phase * k) * amp) / 1000);
+      }
+      k := k + 1;
+    }
+    // Auf 8 Bit bringen: die Summe erreicht rund das 1,5-fache der Grundwelle.
+    PutSample(data, i, (sum * 100) / 1600);
+    i := i + 1;
+  }
+
+  // Die Schleife liegt auf der letzten vollen Schwingung — dort schliesst sich
+  // die Wellenform nahtlos, und genau das verhindert das Knacken.
+  Attach(ins, data, len, len - cyc, cyc);
+  return true;
+}
+
+// ---- Gezupfte Saite (Karplus-Strong) ---------------------------------------
+// Eine Verzoegerungsschleife voller Rauschen, die sich bei jedem Durchlauf
+// selbst mittelt: hohe Anteile verschwinden zuerst, der Grundton bleibt. Was
+// als Krach beginnt, ist nach wenigen Durchlaeufen ein Zupfklang.
+//
+// damping steuert, wie schnell das geschieht (0 = lange, 8 = kurz).
+pub fn MakeStringSample(ins: TInstrument, cycleLen: int64, cycles: int64,
+                        damping: int64): bool {
+  if (ins == null) { return false; }
+  var cyc: int64 := cycleLen;
+  if (cyc < 8) { cyc := 8; }
+  var n: int64 := cycles;
+  if (n < 4) { n := 4; }
+  var len: int64 := cyc * n;
+
+  var data: int64 := alloc(len);
+  if (data == 0) { return false; }
+
+  // Die Schleife mit Rauschen fuellen — das ist der Anschlag.
+  var state: int64 := 0x1234;
+  var i: int64 := 0;
+  while (i < cyc) {
+    state := NoiseNext(state);
+    var v: int64 := (state & 0xFF) - 128;
+    PutSample(data, i, v);
+    i := i + 1;
+  }
+
+  // Danach jeder Wert als Mittel aus dem Wert eine Schwingung zuvor und
+  // seinem Nachbarn. Das ist der ganze Trick.
+  var d: int64 := damping;
+  if (d < 0) { d := 0; }
+  if (d > 8) { d := 8; }
+
+  i := cyc;
+  while (i < len) {
+    var a: int64 := peek8(data + i - cyc);
+    var b: int64 := peek8(data + i - cyc + 1);
+    if (a > 127) { a := a - 256; }
+    if (b > 127) { b := b - 256; }
+    var mittel: int64 := (a + b) / 2;
+    // Zusaetzliche Daempfung: ohne sie klaenge die Saite ewig.
+    mittel := (mittel * (64 - d)) / 64;
+    PutSample(data, i, mittel);
+    i := i + 1;
+  }
+
+  Attach(ins, data, len, 0, 0);
+  return true;
+}
+
+// ---- Schlagwerk ------------------------------------------------------------
+
+// Rauschen mit Huellkurve. Fuer Hi-Hats und Becken: kurzer Abfall gibt eine
+// geschlossene, langer eine offene Hi-Hat. bright hebt die hohen Anteile an,
+// indem nur jeder zweite Rauschwert genommen wird.
+pub fn MakeNoiseSample(ins: TInstrument, len: int64, decay: int64,
+                       bright: bool): bool {
+  if (ins == null) { return false; }
+  var n: int64 := len;
+  if (n < 16) { n := 16; }
+
+  var data: int64 := alloc(n);
+  if (data == 0) { return false; }
+
+  var state: int64 := 0x7A5D;
+  var vorher: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    state := NoiseNext(state);
+    var v: int64 := (state & 0xFF) - 128;
+    if (!bright) {
+      // Tiefpass durch Mittelung mit dem Vorgaenger: dumpfer, mehr Koerper.
+      v := (v + vorher) / 2;
+    }
+    vorher := v;
+
+    // Huellkurve: exponentiell genaehert ueber wiederholte Division.
+    var amp: int64 := 1000;
+    var schritt: int64 := (i * decay) / n;
+    var k: int64 := 0;
+    while (k < schritt) {
+      amp := (amp * 7) / 10;
+      k := k + 1;
+    }
+    PutSample(data, i, (v * amp) / 1000);
+    i := i + 1;
+  }
+
+  Attach(ins, data, n, 0, 0);
+  return true;
+}
+
+// Bassdrum: ein Sinus, dessen Tonhoehe faellt. Genau so bauen es die
+// Rhythmusmaschinen — der Abfall macht den Schlag, nicht die Grundfrequenz.
+pub fn MakeKickSample(ins: TInstrument, len: int64): bool {
+  if (ins == null) { return false; }
+  var n: int64 := len;
+  if (n < 64) { n := 64; }
+
+  var data: int64 := alloc(n);
+  if (data == 0) { return false; }
+
+  var phase: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    // Schrittweite faellt von hoch nach tief: das ist der Sweep.
+    var schritt: int64 := 90 - ((70 * i) / n);
+    phase := phase + schritt;
+
+    var amp: int64 := 1000 - ((1000 * i) / n);
+    amp := (amp * amp) / 1000;                 // schnellerer Abfall am Ende
+    PutSample(data, i, (SinQ(phase) * amp) / 8000);
+    i := i + 1;
+  }
+
+  Attach(ins, data, n, 0, 0);
+  return true;
+}
+
+// Snare: Rauschen und ein Ton zugleich. Der Ton gibt die Tonhoehe, das
+// Rauschen den Teppich — ohne beides klingt es nach Klatschen oder nach Tom.
+pub fn MakeSnareSample(ins: TInstrument, len: int64): bool {
+  if (ins == null) { return false; }
+  var n: int64 := len;
+  if (n < 64) { n := 64; }
+
+  var data: int64 := alloc(n);
+  if (data == 0) { return false; }
+
+  var state: int64 := 0x51F3;
+  var phase: int64 := 0;
+  var i: int64 := 0;
+  while (i < n) {
+    state := NoiseNext(state);
+    var rausch: int64 := (state & 0xFF) - 128;
+    phase := phase + 42;
+    var ton: int64 := SinQ(phase) / 24;
+
+    var amp: int64 := 1000 - ((1000 * i) / n);
+    amp := (amp * amp) / 1000;
+    // Beide Anteile bewusst unter dem Anschlag halten: Rauschen und Ton
+    // treffen sich sonst im ersten Moment und schlagen zusammen an die
+    // Grenze — hoerbar als Knacken statt als Schlag.
+    PutSample(data, i, ((((rausch * 2) / 5) + ton) * amp) / 1000);
+    i := i + 1;
+  }
+
+  Attach(ins, data, n, 0, 0);
+  return true;
+}
+
+// ---- Fertige Instrumentsaetze ---------------------------------------------
+// Die Werte sind gehoert und nicht gerechnet: sie sollen zusammen einen
+// brauchbaren Grundsatz ergeben, mit dem sich sofort etwas tippen laesst.
+
+pub fn MakeDefaultBass(ins: TInstrument): bool {
+  // Saegezahn mit wenigen Oberwellen: tief, rund, traegt.
+  if (!MakeAdditiveSample(ins, 128, 24, 8, false, 1)) { return false; }
+  ins.Volume := 64;
+  ins.Hold := 12;
+  ins.Decay := 5;
+  return true;
+}
+
+pub fn MakeDefaultLead(ins: TInstrument): bool {
+  // Mehr Oberwellen, kuerzere Schwingung: schneidet durch.
+  if (!MakeAdditiveSample(ins, 64, 24, 12, false, 1)) { return false; }
+  ins.Volume := 52;
+  ins.Hold := 16;
+  ins.Decay := 4;
+  return true;
+}
+
+pub fn MakeDefaultPad(ins: TInstrument): bool {
+  // Nur ungerade Oberwellen mit quadratischem Abfall: weich, fast ein Dreieck.
+  if (!MakeAdditiveSample(ins, 96, 32, 16, true, 2)) { return false; }
+  ins.Volume := 44;
+  ins.Hold := 40;
+  ins.Decay := 1;
+  return true;
+}
+
+pub fn MakeDefaultString(ins: TInstrument): bool {
+  if (!MakeStringSample(ins, 96, 40, 2)) { return false; }
+  ins.Volume := 56;
+  ins.Hold := 0;
+  ins.Decay := 0;
+  return true;
+}
+
+pub fn MakeDefaultKick(ins: TInstrument): bool {
+  if (!MakeKickSample(ins, 2400)) { return false; }
+  ins.Volume := 64;
+  return true;
+}
+
+pub fn MakeDefaultSnare(ins: TInstrument): bool {
+  if (!MakeSnareSample(ins, 2600)) { return false; }
+  ins.Volume := 58;
+  return true;
+}
+
+pub fn MakeDefaultClosedHat(ins: TInstrument): bool {
+  if (!MakeNoiseSample(ins, 900, 14, true)) { return false; }
+  ins.Volume := 40;
+  return true;
+}
+
+pub fn MakeDefaultOpenHat(ins: TInstrument): bool {
+  if (!MakeNoiseSample(ins, 4200, 10, true)) { return false; }
+  ins.Volume := 38;
+  return true;
+}

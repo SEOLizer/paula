@@ -52,6 +52,26 @@ where the mixer resolves 504.
 
 ---
 
+## Default instruments
+
+Until a sample is loaded, Paula computes its own instruments rather than
+falling back on a drawn square wave — `OMED/Synth.lyx`, all integer arithmetic:
+
+- **Additive synthesis** for bass, lead and pad: fundamental plus harmonics,
+  summed only up to half the sample rate. That limit is the whole point — a
+  drawn square edge has harmonics that never end, and they fold back as
+  aliasing on high notes. Timbre follows from the weighting: every harmonic at
+  `1/n` gives a sawtooth, odd ones at `1/n²` a soft triangle.
+- **Karplus-Strong** for a plucked string: noise in a delay line that averages
+  itself on every pass.
+- **Noise with an envelope** for percussion, from a 16-bit LFSR like the sound
+  chips of the era. The kick is a sine with falling pitch, the snare mixes
+  noise and tone, the hats differ only in decay.
+
+Melodic instruments loop on their last whole cycle, where the waveform meets
+itself, so a held note does not click on every pass. Measured on the rendered
+demo song, hard edge jumps between adjacent samples dropped from 510 to zero.
+
 ## Requirements
 
 - `lyxc` — the Lyx compiler (tested with 1.1.3C)
@@ -195,6 +215,7 @@ OMED/
   Widgets.lyx       block editor grid, lists, buttons, info bars
   Theme.lyx         colours and bevels
   Sample.lyx        IFF-8SVX and raw sample loading
+  Synth.lyx         computed default instruments
   Playback.lyx      voices, Amiga periods, the three backends
   Replay.lyx        tick/line/block/sequence logic, command dispatch
   Audio.lyx         ALSA output (AC97 on LyxOS)
@@ -218,6 +239,7 @@ lyxc mmdtest.lyx    -I /path/to/aurum -o mmdtest    && ./mmdtest      # MMD read
 lyxc miditest.lyx   -I /path/to/aurum -o miditest   && ./miditest     # MIDI byte stream
 lyxc modtest.lyx    -I /path/to/aurum -o modtest    && ./modtest      # MOD import
 lyxc s3mtest.lyx    -I /path/to/aurum -o s3mtest    && ./s3mtest      # S3M import
+lyxc synthtest.lyx  -I /path/to/aurum -o synthtest  && ./synthtest    # computed instruments
 lyxc sampletest.lyx -I /path/to/aurum -o sampletest && ./sampletest   # samples, periods, mixing
 lyxc renderwav.lyx  -I /path/to/aurum -o renderwav  && ./renderwav    # render to WAV per backend
 ```

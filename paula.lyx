@@ -30,6 +30,7 @@ import OMED.Theme;
 import OMED.Song;
 import OMED.Widgets;
 import OMED.Sample;
+import OMED.Synth;
 import OMED.Playback;
 import OMED.Audio;
 import OMED.Replay;
@@ -856,33 +857,27 @@ fn main(): int64 {
   g_midi := NewMidiOut();
   g_replay.Midi := g_midi;
 
-  // Bis ein Sample geladen ist, bekommt jedes Instrument einen Ersatzklang.
-  // Sonst waere der Editor beim ersten Start lautlos, und man haette keinen
-  // Anhaltspunkt, ob Eingabe und Tonhoehe stimmen.
-  // Ersatzklaenge nach Art des Instruments: Bass, Pad und Lead halten ihren
-  // Ton ueber eine Schleife, solange die Note steht. Snare und Hi-Hats sind
-  // Schlagwerk — eine Schleife wuerde dort durchdroehnen.
+  // Ersatzklaenge, solange kein Sample geladen ist. Sie werden gerechnet,
+  // nicht gezeichnet: additive Synthese fuer die Melodieinstrumente (nur
+  // Oberwellen unterhalb der halben Abtastrate, deshalb ohne das Kratzen
+  // einer harten Rechteckflanke), Rauschen mit Huellkurve fuers Schlagwerk.
+  // Naeheres in OMED/Synth.lyx.
   var n: int64 := 1;
   while (n <= 6) {
     var ins: TInstrument := g_song.Instrument(n);
     if (ins != null) {
       if (ins.SampleData == 0) {
-        if (n == 1) {
-          MakeHeldSample(ins, 96, 40);                      // Bass, tief
-          ins.Hold := 10;                                   // knapp zwei Lines
-          ins.Decay := 6;
-        } else {
-          if (n == 5) {
-            MakeHeldSample(ins, 48, 40);                    // Pad, traegt lang
-            ins.Hold := 30;
-            ins.Decay := 2;
-          } else {
-            if (n == 6) {
-              MakeHeldSample(ins, 24, 40);                  // Lead
-              ins.Hold := 14;
-              ins.Decay := 5;
-            } else {
-              MakeSquareSample(ins, 32, 24);                // Snare, Hi-Hats
+        if (n == 1) { MakeDefaultBass(ins); }
+        else {
+          if (n == 2) { MakeDefaultSnare(ins); }
+          else {
+            if (n == 3) { MakeDefaultClosedHat(ins); }
+            else {
+              if (n == 4) { MakeDefaultOpenHat(ins); }
+              else {
+                if (n == 5) { MakeDefaultPad(ins); }
+                else { MakeDefaultLead(ins); }
+              }
             }
           }
         }
@@ -891,7 +886,10 @@ fn main(): int64 {
     n := n + 1;
   }
 
+  // Die Dialoge brauchen die Anwendung fuer ShowModal — ohne diese Zuweisung
+  // steigt jede Dialogaktion still wieder aus.
   g_app := app;
+
   var f: TForm := BuildMainWindow(app);
   if (f == null) {
     PrintStrLn("Paula: Fenster konnte nicht angelegt werden");
