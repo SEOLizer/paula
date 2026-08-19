@@ -1,0 +1,141 @@
+// replaytest.lyx — Pruefprogramm fuer die Replay-Engine (Phase 7), ohne
+// Oberflaeche und ohne Audiogeraet: gepruefft wird der Zustand der Tracks
+// nach einer bestimmten Zahl von Ticks.
+import std.io;
+import OMED.Song;
+import OMED.Sample;
+import OMED.Playback;
+import OMED.Replay;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintIntLn(v);
+}
+
+fn Check(label: pchar, got: int64, want: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintInt(got);
+  if (got == want) { PrintStrLn("  OK"); }
+  else {
+    PrintStr("  ERWARTET ");
+    PrintIntLn(want);
+  }
+}
+
+// Ticks laufen lassen.
+fn Run(e: TReplayEngine, n: int64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    e.DoTick();
+    i := i + 1;
+  }
+}
+
+fn main(): int64 {
+  var song: TSong := NewSong("Test");
+  var ins: TInstrument := NewInstrument("Square");
+  MakeSquareSample(ins, 32, 60);
+  ins.Volume := 64;
+  song.AddInstrument(ins);
+  song.Tpl := 6;
+  song.Tempo := 125;
+
+  var b: TBlock := NewBlock(4, 16);
+  // Track 0: Note, dann Set Volume 0C20, dann Slide Down 02 04
+  b.PutCell(0, 0, CellPack(25, 1, 0x00, 0x00));   // C-3 01
+  b.PutCell(1, 0, CellPack(0, 0, 0x0C, 0x20));    // Set Volume 32
+  b.PutCell(2, 0, CellPack(0, 0, 0x02, 0x04));    // Slide Pitch Down 4
+  // Track 1: Note, dann Arpeggio 00 47
+  b.PutCell(0, 1, CellPack(25, 1, 0x00, 0x00));
+  b.PutCell(1, 1, CellPack(0, 0, 0x00, 0x47));
+  // Track 2: Note, dann Portamento auf C-4 (Note 37)
+  b.PutCell(0, 2, CellPack(25, 1, 0x00, 0x00));
+  b.PutCell(1, 2, CellPack(37, 0, 0x03, 0x10));
+  song.AddBlock(b);
+  song.AddSequenceEntry(0);
+
+  var mix: TSoftwareMixerBackend := NewSoftwareMixerBackend(8);
+  mix.Init(OM_MIX_RATE);
+
+  var e: TReplayEngine := NewReplayEngine();
+  e.Attach(song, mix as TPlaybackBackend);
+
+  Check("frames je tick @125", e.FramesPerTick(OM_MIX_RATE), 882);
+
+  e.PlayBlock(0);
+
+  // Tick 0 der Line 0: drei Noten angeschlagen.
+  e.DoTick();
+  Check("aktive stimmen nach line 0", mix.ActiveVoices(), 3);
+  Check("periode track 0", e.Track(0).Period, 214);
+
+  // Rest der Line 0 (TPL 6), dann Tick 0 der Line 1 = Set Volume.
+  Run(e, 5);
+  Check("line nach 6 ticks", e.Line, 1);
+  e.DoTick();
+  Check("volume track 0 nach 0C20", e.Track(0).Volume, 32);
+
+  // Arpeggio auf Track 1: Tick 1 = +4 Halbtoene, Tick 2 = +7.
+  e.DoTick();
+  var arp1: int64 := e.Track(1).Period;
+  e.DoTick();
+  var arp2: int64 := e.Track(1).Period;
+  Check("arpeggio +4 halbtoene", arp1, PeriodShiftSemitones(214, 4));
+  Check("arpeggio +7 halbtoene", arp2, PeriodShiftSemitones(214, 7));
+
+  // Portamento auf Track 2: Ziel ist C-4 (Periode 107), pro Tick 16 naeher.
+  // 214 - 2*16 = 182.
+  Check("portamento ziel", e.Track(2).TargetPeriod, 107);
+  Check("portamento periode nach 2 ticks", e.Track(2).Period, 182);
+
+  // Line 2: Slide Pitch Down 4 auf Track 0. Genau messen heisst: von Line 0
+  // aus neu starten und bis Tick 0 der Line 2 laufen, sonst zaehlt man die
+  // Ticks der vorigen Line mit.
+  e.PlayBlock(0);
+  Run(e, 2 * 6 + 1);          // Lines 0 und 1 komplett, dann Tick 0 der Line 2
+  Check("line", e.Line, 2);
+  var p0: int64 := e.Track(0).Period;
+  e.DoTick();
+  e.DoTick();
+  Check("slide down nach 2 ticks", e.Track(0).Period, p0 + 8);
+
+  // Blockende: nach 16 Lines faengt der Block wieder bei 0 an.
+  e.PlayBlock(0);
+  Run(e, 16 * 6);
+  Check("line nach einem umlauf", e.Line, 0);
+  Check("spielt noch", e.Playing as int64, 1);
+
+  // Tempo-Command 0F: Level 01..F0 setzt das Tempo.
+  var b2: TBlock := NewBlock(1, 4);
+  b2.PutCell(0, 0, CellPack(25, 1, 0x0F, 0x64));   // Tempo 100
+  song.AddBlock(b2);
+  e.PlayBlock(1);
+  e.DoTick();
+  Check("tempo nach 0F64", e.Tempo, 100);
+  Check("frames je tick @100", e.FramesPerTick(OM_MIX_RATE), 1102);
+
+  // Command 18 (Cut Note): ab Tick 3 stumm.
+  var b3: TBlock := NewBlock(1, 4);
+  b3.PutCell(0, 0, CellPack(25, 1, 0x18, 0x03));
+  song.AddBlock(b3);
+  e.PlayBlock(2);
+  Run(e, 3);
+  Show("volume vor dem cut", e.Track(0).Volume);
+  e.DoTick();
+  Check("volume nach cut", e.Track(0).Volume, 0);
+
+  // Command 16 (Repeat Lines): Marke auf Line 0, zweimal wiederholen.
+  var b4: TBlock := NewBlock(1, 4);
+  b4.PutCell(0, 0, CellPack(25, 1, 0x16, 0x00));   // Marke
+  b4.PutCell(2, 0, CellPack(0, 0, 0x16, 0x02));    // zweimal zurueck
+  song.AddBlock(b4);
+  e.PlayBlock(3);
+  Run(e, 3 * 6);       // Lines 0,1,2 gespielt -> Sprung zurueck auf 0
+  Check("loop zurueck auf line", e.Line, 0);
+
+  e.Stop();
+  Check("gestoppt", e.Playing as int64, 0);
+  return 0;
+}

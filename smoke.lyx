@@ -1,0 +1,12 @@
+import std.io;
+import Vega.Forms;
+import Vega.Backend.X11;
+
+fn main(): int64 {
+  var app: TApplication := NewApplication(NewX11Backend());
+  if (!app.Ready) { PrintStrLn("kein X11"); return 1; }
+  var f: TForm := NewForm(400, 200, "smoke");
+  app.ShowForm(f);
+  app.Run();
+  return 0;
+}

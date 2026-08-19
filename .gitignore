@@ -1,0 +1,28 @@
+# Compiled programs — everything here is built from the .lyx sources
+paula
+smoke
+renderwav
+replaytest
+mmdtest
+miditest
+modtest
+sampletest
+playtest
+loadtest
+latencytest
+
+# Rendered audio and scratch output
+*.wav
+*.pcm
+*.raw
+*.out
+
+# Vendored dependency copy and its symlink
+/Vega
+/VegaPatched
+
+# Music files are other people's work — keep them out of the repository
+*.mod
+*.med
+*.mmd
+/Songs/

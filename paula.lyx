@@ -1,0 +1,892 @@
+// paula.lyx — das Hauptfenster von Paula.
+//
+// Aufbau wie in OctaMED Professional V5/V6, von oben nach unten:
+//
+//   Menueleiste
+//   SONG / BLOCK / TEMPO / TPL / LPB
+//   Blockeditor
+//   Instrumentliste | Blockliste (Song Sequence)
+//   Instr / Octave / Step
+//   Play Song | Play Block | Stop | Rec
+//
+// Die Reihenfolge, in der die Kinder angelegt werden, IST das Layout: Vegas
+// ApplyLayout arbeitet sie wie Delphi der Reihe nach ab, jedes ausgerichtete
+// Kind nimmt sich seinen Rand vom Rest. Deshalb kommen alle Raender vor dem
+// AL_CLIENT-Kind — sonst frisst der Blockeditor die ganze Flaeche.
+//
+// Was Phase 1 noch NICHT tut: Cursor bewegen, tippen, spielen. Die Menuebefehle
+// sind angelegt, aber leer. Das ist Absicht — erst steht das Bild, dann die
+// Bedienung (Phase 2/3).
+
+import std.io;
+import Vega.Types;
+import Vega.Forms;
+import Vega.Control;
+import Vega.Menus;
+import Vega.Themes;
+import Vega.Backend.X11;
+import Vega.FileDlg;
+import OMED.Theme;
+import OMED.Song;
+import OMED.Widgets;
+import OMED.Sample;
+import OMED.Playback;
+import OMED.Audio;
+import OMED.Replay;
+import OMED.Midi;
+import OMED.Dialogs;
+import OMED.MMD;
+import OMED.MOD;
+import std.fs;
+
+con WIN_W: int64 := 720;
+con WIN_H: int64 := 560;
+
+// Modulvariablen ALLE hier oben: eine Modulvariable, die erst nach ihrer
+// ersten Verwendung deklariert wird, zerfaellt in lyxc in zwei Variablen
+// (Befund G in lyx-gpi/ISSUE-lyxc-und-vega.md).
+var g_song: TSong;
+var g_grid: TOmedGrid;
+var g_info: TOmedInfoBar;
+var g_editbar: TOmedEditBar;
+var g_instr: TOmedList;
+var g_blocks: TOmedList;
+var g_block_no: int64;
+var g_form: TForm;
+var g_lists: TControl;
+var g_transport: TControl;
+var g_app: TApplication;
+var g_backend: TPlaybackBackend;
+var g_mode: int64;       // 0 = 4 Channel Paula, 1 = Modern Mixer
+var g_audio: TOmedAudio;
+var g_pcm: int64;        // Mischpuffer der Vorhoerhilfe
+var g_pcm_frames: int64;
+var g_replay: TReplayEngine;
+var g_tick_buf: int64;      // ein Tick Audio
+var g_timer: TTimer;
+var g_midi: TMidiOut;
+var g_clip: TBlock;      // Zwischenablage: ein Ausschnitt IST ein kleiner Block
+
+// ---- Demo-Song -------------------------------------------------------------
+// Ein kleiner Block mit Inhalt, damit beim ersten Start ein Raster zu sehen
+// ist und nicht eine leere Flaeche. Entspricht dem Beispiel aus der README.
+fn BuildDemoSong(): TSong {
+  var s: TSong := NewSong("Demo Song");
+
+  s.AddInstrument(NewInstrument("Bass"));
+  s.AddInstrument(NewInstrument("Snare"));
+  s.AddInstrument(NewInstrument("Closed Hat"));
+  s.AddInstrument(NewInstrument("Open Hat"));
+  s.AddInstrument(NewInstrument("Pad"));
+  s.AddInstrument(NewInstrument("Lead"));
+
+  var b: TBlock := NewBlock(4, 64);
+  b.Name := "Intro";
+
+  // Notennummer = (Oktave - 1) * 12 + Halbton + 1, denn 1 ist C-1.
+  // C-3 = 25, D-3 = 27, E-3 = 29, G-2 = 20, A-3 = 34, C-4 = 37, A-4 = 46.
+  b.PutCell(0, 0, CellPack(25, 1, 0, 0));      // C-3 01 000
+  b.PutCell(0, 2, CellPack(20, 3, 0, 0));      // G-2 03 000
+  b.PutCell(2, 1, CellPack(37, 2, 0, 0));      // C-4 02 000
+  b.PutCell(4, 0, CellPack(29, 1, 0, 0x37));   // E-3 01 037
+  b.PutCell(4, 2, CellPack(27, 3, 0, 0));      // D-3 03 000
+  b.PutCell(8, 0, CellPack(25, 1, 0x0C, 0x40));// C-3 01 0C40 (Set Volume)
+  b.PutCell(12, 3, CellPack(34, 5, 0, 0));     // A-3 05 000
+  b.PutCell(16, 0, CellPack(25, 1, 0, 0));
+  b.PutCell(16, 1, CellPack(37, 2, 0, 0));
+
+  s.AddBlock(b);
+
+  // "Main" war bis hierher ein Platzhalter mit zwei Noten auf Line 0 — beim
+  // Abspielen folgten darauf 63 leere Lines, also rund acht Sekunden Stille
+  // mitten im Stueck. Jetzt steht dort ein durchgehendes Muster: Bass auf
+  // jedem Beat, Snare auf den Gegenschlag, Hi-Hats dazwischen und eine
+  // Melodie darueber.
+  var b2: TBlock := NewBlock(4, 64);
+  b2.Name := "Main";
+
+  var i: int64 := 0;
+  while (i < 64) {
+    // Track 0: Bass. C-2 auf der Eins, G-1 auf der Drei jedes Taktes.
+    if ((i % 8) == 0) { b2.PutCell(i, 0, CellPack(13, 1, 0, 0)); }
+    if ((i % 8) == 4) { b2.PutCell(i, 0, CellPack(8, 1, 0, 0)); }
+
+    // Track 1: Snare auf den Gegenschlag.
+    if ((i % 8) == 4) { b2.PutCell(i, 1, CellPack(25, 2, 0, 0)); }
+
+    // Track 2: Hi-Hats, jede zweite Line, offen am Taktende.
+    if ((i % 2) == 0) {
+      if ((i % 8) == 6) { b2.PutCell(i, 2, CellPack(37, 4, 0, 0)); }
+      else { b2.PutCell(i, 2, CellPack(37, 3, 0x0C, 0x20)); }
+    }
+    i := i + 1;
+  }
+
+  // Track 3: eine Melodie ueber zwei Takte, danach wiederholt sie sich.
+  var mel: int64 := 0;
+  while (mel < 64) {
+    b2.PutCell(mel + 0, 3, CellPack(37, 6, 0, 0));        // C-4
+    b2.PutCell(mel + 3, 3, CellPack(41, 6, 0, 0));        // E-4
+    b2.PutCell(mel + 6, 3, CellPack(44, 6, 0, 0));        // G-4
+    b2.PutCell(mel + 8, 3, CellPack(46, 6, 0x00, 0x37));  // A-4 mit Arpeggio
+    b2.PutCell(mel + 12, 3, CellPack(44, 6, 0x0D, 0x02)); // G-4, ausblendend
+    mel := mel + 16;
+  }
+  s.AddBlock(b2);
+
+  // Playing Sequence: Intro einmal, Main zweimal.
+  s.AddSequenceEntry(0);
+  s.AddSequenceEntry(1);
+  s.AddSequenceEntry(1);
+
+  return s;
+}
+
+// ---- Menuebefehle ----------------------------------------------------------
+// Noch ohne Wirkung, aber vorhanden: eine Menueleiste, deren Eintraege beim
+// Klick nichts tun, ist ehrlicher als eine, die es nicht gibt — der Aufbau
+// des Fensters steht damit fest, und die Phasen 2..10 haengen ihre Befehle
+// nur noch ein.
+fn ActNothing(sender: TControl): void { }
+
+fn ActViewExtCmd(sender: TControl): void {
+  if (g_grid == null) { return; }
+  g_grid.ExtCmd := !g_grid.ExtCmd;
+  // Die schmale Anzeige hat ein Cursorfeld weniger — ohne Nachziehen stuende
+  // der Cursor nach dem Umschalten auf einem Feld, das es nicht mehr gibt.
+  g_grid.SetCursor(g_grid.CurLine, g_grid.CurTrack, g_grid.CurCol);
+}
+
+fn ActViewHexLines(sender: TControl): void {
+  if (g_grid == null) { return; }
+  g_grid.HexLines := !g_grid.HexLines;
+  g_grid.Invalidate();
+}
+
+// ---- Vorhoeren -------------------------------------------------------------
+// Ein angeschlagener Ton wird in einen Puffer gemischt und am Stueck
+// ausgegeben. Das blockiert fuer seine Dauer — vertretbar fuer eine
+// Vorhoerhilfe, und ab Phase 5 loest die Tickschleife das ohnehin ab.
+con PREVIEW_MS: int64 := 350;
+
+// Playback-Modus umschalten. Die Modi sind keine Klangvarianten desselben
+// Mixers, sondern verschiedene Backends — deshalb wird hier ein anderes
+// Objekt gebaut und nicht ein Schalter gesetzt.
+con MODE_PAULA: int64 := 0;
+con MODE_8CH: int64 := 1;
+con MODE_MIXER: int64 := 2;
+
+fn SetPlaybackMode(mode: int64): void {
+  g_mode := mode;
+  if (mode == MODE_MIXER) {
+    g_backend := NewSoftwareMixerBackend(OM_MIX_CHANNELS) as TPlaybackBackend;
+  } else {
+    if (mode == MODE_8CH) {
+      g_backend := NewOctaMed8ChannelBackend() as TPlaybackBackend;
+    } else {
+      g_backend := NewPaula4ChannelBackend() as TPlaybackBackend;
+    }
+  }
+  g_backend.Init(OM_MIX_RATE);
+  // Der Modus gehoert zum Song, nicht nur zum Programm: FLAG_8CHANNEL steht
+  // im Songheader und muss beim Sichern wieder dort landen.
+  if (g_song != null) { g_song.EightChannel := (mode == MODE_8CH); }
+  if (g_replay != null) { g_replay.Backend := g_backend; }
+}
+
+// ---- Abspielen -------------------------------------------------------------
+// Der Timer ist die Uhr des Replays: er ruft je Tick die Engine, mischt einen
+// Tick Audio und schiebt ihn in den ALSA-Strom. Der Schreibvorgang blockiert,
+// bis das Geraet Platz hat — dadurch haelt sich das Ganze von selbst im Takt,
+// ohne dass irgendwo eine Wartezeit gezaehlt wird.
+//
+// Der Zeichenteil folgt der gespielten Line: im Tracker schaut man beim Hoeren
+// auf das Raster, ein stehender Cursor waere unbrauchbar.
+fn OnReplayTick(sender: TControl): void {
+  if (g_replay == null) { return; }
+  if (!g_replay.Playing) { return; }
+  if (g_backend == null) { return; }
+  if (g_tick_buf == 0) { return; }
+  if (g_audio == null) { return; }
+
+  // So viele Ticks rendern, wie in den Geraetepuffer passen — nicht genau
+  // einen je Timeraufruf. Der Timer ist ungenau (die Oberflaeche laeuft in
+  // derselben Schleife); wer sich auf ihn verlaesst, laesst den Puffer
+  // leerlaufen, und dann bricht der Ton nach dem ersten Block ab.
+  var frames: int64 := g_replay.FramesPerTick(OM_MIX_RATE);
+  if (frames < 1) { return; }
+
+  // Vorlauf: so viel Ton haelt das Programm dem Geraet voraus. Das ist eine
+  // Abwaegung, keine freie Wahl — zu wenig, und der Puffer laeuft leer,
+  // sobald das Raster neu gezeichnet wird (gemessen: 15 Aussetzer je Sekunde
+  // bei 40 ms); zu viel, und der Cursor laeuft der Musik davon. Sechs Ticks
+  // muss ueber der laengsten gemessenen Zeichenpause liegen (263 ms), sonst
+  // knackt es bei jeder. Zwanzig Ticks sind rund 400 ms.
+  var vorlauf: int64 := frames * 30;
+
+
+  // Die Obergrenze ist eine Notbremse gegen Endlosschleifen, keine Drossel:
+  // sie muss ueber dem liegen, was eine Zeichenpause verbraucht. Mit acht
+  // Runden (160 ms) lieferte das Programm bei 316-ms-Pausen weniger nach, als
+  // verbraucht wurde — der Vorrat schrumpfte auf 56 ms und lief dann leer.
+  var runden: int64 := 0;
+  while (runden < 64) {
+    if (g_audio.Delay() >= vorlauf) { runden := 64; }
+    else {
+      if (g_audio.Avail() < frames) { runden := 64; }
+    else {
+      if (!g_replay.DoTick()) { runden := 64; }
+      else {
+        // Kein Nullen des Puffers: RenderTick beschreibt JEDEN Frame
+        // vollstaendig (beide Kanaele, je zwei Bytes). Das Vorabloeschen
+        // waren 3528 einzelne Schreibzugriffe je Tick — reine Arbeit ohne
+        // Wirkung, und sie fiel genau in die Zeit, die fuer den Nachschub
+        // fehlte.
+        g_backend.RenderTick(g_tick_buf, frames);
+        g_audio.WriteFrames(g_tick_buf, frames);
+        runden := runden + 1;
+
+        // Das Bild folgt der gespielten Line, aber nur auf Tick 0: bei jedem
+        // Tick neu zu zeichnen hiesse sechsmal je Line dasselbe Bild.
+        if (g_replay.Tick == 1) {
+          if (g_grid != null) {
+            if (g_grid.Block != null) {
+              g_grid.SetCursor(g_replay.Line, g_grid.CurTrack, g_grid.CurCol);
+            }
+          }
+        }
+        }
+      }
+    }
+  }
+}
+
+fn ActPlaySong(sender: TControl): void {
+  if (g_replay == null) { return; }
+  // Mit leerem Geraetepuffer anfangen, sonst klebt der Rest des vorigen
+  // Durchlaufs vorn am neuen.
+  if (g_audio != null) { g_audio.Flush(); }
+  g_replay.Attach(g_song, g_backend);
+  g_replay.PlaySong();
+}
+
+fn ActPlayBlock(sender: TControl): void {
+  if (g_replay == null) { return; }
+  // Mit leerem Geraetepuffer anfangen, sonst klebt der Rest des vorigen
+  // Durchlaufs vorn am neuen.
+  if (g_audio != null) { g_audio.Flush(); }
+  g_replay.Attach(g_song, g_backend);
+  g_replay.PlayBlock(g_block_no);
+}
+
+fn ActStop(sender: TControl): void {
+  if (g_replay == null) { return; }
+  g_replay.Stop();
+  // Was im Geraet steht, gehoert nicht mehr zum Stueck: ohne Verwerfen liefe
+  // der Puffer nach dem Stopp noch hoerbar weiter.
+  if (g_audio != null) { g_audio.Flush(); }
+}
+
+fn ActModePaula(sender: TControl): void { SetPlaybackMode(MODE_PAULA); }
+fn ActMode8Ch(sender: TControl): void { SetPlaybackMode(MODE_8CH); }
+fn ActModeMixer(sender: TControl): void { SetPlaybackMode(MODE_MIXER); }
+
+fn PreviewNote(sender: TControl, note: int64, instr: int64): void {
+  if (g_backend == null) { return; }
+  if (g_audio == null) { return; }
+  if (g_song == null) { return; }
+
+  var ins: TInstrument := g_song.Instrument(instr);
+  if (ins == null) { return; }
+  if (ins.SampleData == 0) { return; }
+
+  // Der Kanal folgt dem Track, auf dem getippt wird: im Paula-Modus hoert man
+  // dadurch schon beim Eingeben, auf welcher Seite die Note spaeter liegt.
+  var ch: int64 := 0;
+  if (g_grid != null) { ch := g_grid.CurTrack; }
+
+  var period: int64 := NotePeriod(note + ins.Transpose, ins.FineTune);
+  g_backend.NoteOff(ch);
+  g_backend.NoteOn(ch, ins, period, ins.Volume);
+
+  if (g_pcm == 0) { return; }
+  // Der Puffer wird vor jedem Ton geleert: RenderTick mischt nur dazu, was
+  // die Stimmen liefern, und eine ausgelaufene Stimme wuerde sonst den
+  // vorigen Ton stehen lassen.
+  var i: int64 := 0;
+  while (i < g_pcm_frames * 4) {
+    poke8(g_pcm + i, 0);
+    i := i + 1;
+  }
+  g_backend.RenderTick(g_pcm, g_pcm_frames);
+  g_audio.PlayPCM(g_pcm, g_pcm_frames);
+  g_backend.NoteOff(ch);
+}
+
+// Sample in das in der Instrumentliste gewaehlte Instrument laden. Das Format
+// erkennt LoadSampleFile am Inhalt — die Endung sagt bei Amiga-Samples nichts.
+fn ActLoadSample(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_app == null) { return; }
+  if (g_instr == null) { return; }
+
+  var number: int64 := g_instr.Sel + 1;
+  var ins: TInstrument := g_song.Instrument(number);
+  if (ins == null) { return; }
+
+  var dlg: TOpenDialog := NewOpenDialog();
+  dlg.SetTitle("Load Sample");
+  dlg.SetFilter("*");
+  if (dlg.Execute(g_app)) {
+    var path: TTextBuffer := new TTextBuffer();
+    dlg.FullPath(path);
+    if (LoadSampleFile(ins, path.AsPChar())) {
+      if (g_editbar != null) { g_editbar.Invalidate(); }
+    } else {
+      PrintStrLn("Paula: Sample konnte nicht geladen werden");
+    }
+    path.Destroy();
+  }
+  dlg.Destroy();
+}
+
+// Block Properties: Name, Trackzahl, Linezahl. Danach muessen Grid und
+// Blockliste neu gezeichnet werden — die Masse des Blocks stehen in beiden.
+fn ActBlockProps(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_app == null) { return; }
+  var b: TBlock := g_song.BlockAt(g_block_no);
+  if (b == null) { return; }
+  if (ShowBlockProperties(g_app, b, g_block_no)) {
+    if (g_grid != null) {
+      g_grid.Attach(g_song, b);
+    }
+    FillLists();
+  }
+}
+
+// Neuer Block mit den Massen des aktuellen — das ist beim Weiterschreiben
+// fast immer gemeint, und aendern laesst er sich in den Block Properties.
+fn ActNewBlock(sender: TControl): void {
+  if (g_song == null) { return; }
+  var cur: TBlock := g_song.BlockAt(g_block_no);
+  var tracks: int64 := 4;
+  var lines: int64 := 64;
+  if (cur != null) {
+    tracks := cur.Tracks;
+    lines := cur.Lines;
+  }
+  var b: TBlock := NewBlock(tracks, lines);
+  b.Name := "Block";
+  g_block_no := g_song.AddBlock(b);
+  g_song.AddSequenceEntry(g_block_no);
+  if (g_grid != null) { g_grid.Attach(g_song, b); }
+  if (g_info != null) { g_info.ShowBlock(g_block_no); }
+  FillLists();
+}
+
+// Transponieren wirkt auf die Markierung, sonst auf die Cursorzelle — dieselbe
+// Regel wie bei den Bereichsbefehlen im Edit-Menue.
+fn ActTransposeUp(sender: TControl): void {
+  if (g_grid != null) { g_grid.TransposeRange(1); }
+}
+
+fn ActTransposeDown(sender: TControl): void {
+  if (g_grid != null) { g_grid.TransposeRange(-1); }
+}
+
+fn ActTransposeOctUp(sender: TControl): void {
+  if (g_grid != null) { g_grid.TransposeRange(12); }
+}
+
+fn ActTransposeOctDown(sender: TControl): void {
+  if (g_grid != null) { g_grid.TransposeRange(-12); }
+}
+
+// Teilen an der Cursorline: was darunter steht, wird ein eigener Block direkt
+// hinter dem aktuellen.
+fn ActSplitBlock(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_grid == null) { return; }
+  if (!g_song.SplitBlockAt(g_block_no, g_grid.CurLine)) { return; }
+  g_grid.Attach(g_song, g_song.BlockAt(g_block_no));
+  FillLists();
+}
+
+fn ActJoinBlock(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (!g_song.JoinWithNext(g_block_no)) { return; }
+  if (g_grid != null) { g_grid.Attach(g_song, g_song.BlockAt(g_block_no)); }
+  FillLists();
+}
+
+fn ActSequence(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_app == null) { return; }
+  ShowSequenceWindow(g_app, g_song);
+  FillLists();
+}
+
+// Klick in die Blockliste schaltet den Blockeditor um. Ohne das waere die
+// Liste eine Anzeige und kein Bedienelement — und ein zweiter Block liesse
+// sich gar nicht erreichen.
+fn ActSelectBlock(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_blocks == null) { return; }
+  var no: int64 := g_blocks.Sel;
+  var b: TBlock := g_song.BlockAt(no);
+  if (b == null) { return; }
+  g_block_no := no;
+  if (g_grid != null) { g_grid.Attach(g_song, b); }
+  if (g_info != null) { g_info.ShowBlock(no); }
+}
+
+// Klick in die Instrumentliste setzt das Eingabeinstrument — genau das
+// erwartet man, wenn man vor dem Tippen ein Instrument auswaehlt.
+fn ActSelectInstr(sender: TControl): void {
+  if (g_instr == null) { return; }
+  if (g_editbar == null) { return; }
+  g_editbar.Instr := g_instr.Sel + 1;
+  g_editbar.Invalidate();
+}
+
+// Modul laden. Ein fehlgeschlagener Ladeversuch laesst den bisherigen Song
+// unangetastet — der halb geladene Zustand waere schlimmer als gar keiner.
+fn ActLoadSong(sender: TControl): void {
+  if (g_app == null) { return; }
+
+  var dlg: TOpenDialog := NewOpenDialog();
+  dlg.SetTitle("Load Song");
+  dlg.SetFilter("*");
+  if (dlg.Execute(g_app)) {
+    var path: TTextBuffer := new TTextBuffer();
+    dlg.FullPath(path);
+    // Format am Inhalt erkennen, nicht an der Endung. MOD traegt seine
+    // Kennung bei Byte 1080, MMD am Anfang — beide sagen es also selbst.
+    var loaded: TSong := null;
+    if (IsMOD(path.AsPChar())) { loaded := LoadMOD(path.AsPChar()); }
+    else { loaded := LoadMMD(path.AsPChar()); }
+
+    if (loaded == null) {
+      PrintStrLn("Paula: kein lesbares Modul (MMD0/1/2 oder MOD)");
+    } else {
+      // Der geladene Modus gehoert zum Song: FLAG_8CHANNEL entscheidet in
+      // AdoptSong, mit welchem Backend das Stueck klingen soll.
+      AdoptSong(loaded);
+    }
+    path.Destroy();
+  }
+  dlg.Destroy();
+}
+
+// Song im Editor bekanntmachen — nach Laden und nach New Song derselbe Weg.
+fn AdoptSong(s: TSong): void {
+  if (s == null) { return; }
+  if (g_replay != null) { g_replay.Stop(); }
+  g_song := s;
+  g_block_no := 0;
+
+  if (g_song.EightChannel) { SetPlaybackMode(MODE_8CH); }
+  else { SetPlaybackMode(MODE_PAULA); }
+
+  if (g_replay != null) { g_replay.Attach(g_song, g_backend); }
+  if (g_grid != null) { g_grid.Attach(g_song, g_song.BlockAt(0)); }
+  if (g_info != null) {
+    g_info.Attach(g_song);
+    g_info.ShowBlock(0);
+  }
+  if (g_editbar != null) {
+    g_editbar.Attach(g_song);
+    g_editbar.Instr := 1;
+  }
+  FillLists();
+}
+
+// Leerer Song: ein Block, eine Sequence mit diesem Block, keine Instrumente.
+// Ohne den Block haette der Editor nichts zu zeigen, ohne den Sequenzeintrag
+// spielte Play Song ins Leere.
+fn ActNewSong(sender: TControl): void {
+  var s: TSong := NewSong("Untitled");
+  var b: TBlock := NewBlock(4, 64);
+  b.Name := "Block";
+  s.AddBlock(b);
+  s.AddSequenceEntry(0);
+  AdoptSong(s);
+}
+
+// Sichern als MMD1. Geschrieben wird immer dieses Format, auch wenn das
+// geladene Modul MMD0 oder MMD2 war: MMD0 kann Commands ueber 0F nicht
+// darstellen, und alles, was hier entsteht, passt in MMD1.
+fn ActSaveSong(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_app == null) { return; }
+
+  var dlg: TSaveDialog := NewSaveDialog();
+  dlg.SetTitle("Save Song");
+  dlg.SetFilter("*");
+  dlg.SetDefaultExt(".med");
+  dlg.SetFileName(g_song.Name);
+  if (dlg.Execute(g_app)) {
+    var path: TTextBuffer := new TTextBuffer();
+    dlg.FullPath(path);
+    if (!SaveMMD(g_song, path.AsPChar())) {
+      PrintStrLn("Paula: Song konnte nicht gesichert werden");
+    }
+    path.Destroy();
+  }
+  dlg.Destroy();
+}
+
+fn ActInstrProps(sender: TControl): void {
+  if (g_song == null) { return; }
+  if (g_app == null) { return; }
+  if (g_instr == null) { return; }
+  var number: int64 := g_instr.Sel + 1;
+  var ins: TInstrument := g_song.Instrument(number);
+  if (ins == null) { return; }
+  if (ShowInstrumentProperties(g_app, ins, number)) {
+    FillLists();
+    if (g_editbar != null) { g_editbar.Invalidate(); }
+  }
+}
+
+fn ActMidiSetup(sender: TControl): void {
+  if (g_app == null) { return; }
+  if (g_midi == null) { return; }
+  ShowMidiSetup(g_app, g_midi);
+}
+
+// ---- Edit-Menue ------------------------------------------------------------
+// Ohne Markierung wirken die Befehle auf die Zelle unter dem Cursor. Das ist
+// keine Notloesung, sondern die Erwartung: eine einzelne Zelle zu kopieren
+// soll nicht erst eine Markierung verlangen.
+fn ActCopyRange(sender: TControl): void {
+  if (g_grid == null) { return; }
+  g_clip := g_grid.CopySelection();
+}
+
+fn ActCutRange(sender: TControl): void {
+  if (g_grid == null) { return; }
+  g_clip := g_grid.CopySelection();
+  g_grid.ClearRange();
+}
+
+fn ActPasteRange(sender: TControl): void {
+  if (g_grid == null) { return; }
+  if (g_clip == null) { return; }
+  g_grid.PasteAt(g_clip);
+}
+
+fn ActClearRange(sender: TControl): void {
+  if (g_grid == null) { return; }
+  g_grid.ClearRange();
+}
+
+fn BuildMenu(f: TForm): void {
+  var mm: TMainMenu := NewMainMenu();
+
+  var mProject: TMenuItem := mm.Add("Project");
+  var miNew: TMenuItem := mProject.Add("New Song");
+  miNew.OnClick := ActNewSong;
+  var miLoad: TMenuItem := mProject.Add("Load Song...");
+  miLoad.OnClick := ActLoadSong;
+  var miSave: TMenuItem := mProject.Add("Save Song...");
+  miSave.OnClick := ActSaveSong;
+  mProject.AddSeparator();
+  var miQuit: TMenuItem := mProject.Add("Quit");
+  miQuit.OnClick := ActNothing;
+
+  var mBlock: TMenuItem := mm.Add("Block");
+  var miBlockProps: TMenuItem := mBlock.Add("Block Properties...");
+  miBlockProps.OnClick := ActBlockProps;
+  var miBlockNew: TMenuItem := mBlock.Add("New Block");
+  miBlockNew.OnClick := ActNewBlock;
+  var miSeq: TMenuItem := mBlock.Add("Song Sequence...");
+  miSeq.OnClick := ActSequence;
+  mBlock.AddSeparator();
+  var miSplit: TMenuItem := mBlock.Add("Split at Cursor");
+  miSplit.OnClick := ActSplitBlock;
+  var miJoin: TMenuItem := mBlock.Add("Join with Next");
+  miJoin.OnClick := ActJoinBlock;
+  mBlock.AddSeparator();
+  var miTrUp: TMenuItem := mBlock.Add("Transpose +1");
+  miTrUp.OnClick := ActTransposeUp;
+  var miTrDn: TMenuItem := mBlock.Add("Transpose -1");
+  miTrDn.OnClick := ActTransposeDown;
+  var miTrOctUp: TMenuItem := mBlock.Add("Transpose +12");
+  miTrOctUp.OnClick := ActTransposeOctUp;
+  var miTrOctDn: TMenuItem := mBlock.Add("Transpose -12");
+  miTrOctDn.OnClick := ActTransposeOctDown;
+  mBlock.AddSeparator();
+  var miExt: TMenuItem := mBlock.Add("Extended Command Display");
+  miExt.OnClick := ActViewExtCmd;
+  var miHex: TMenuItem := mBlock.Add("Hex Line Numbers");
+  miHex.OnClick := ActViewHexLines;
+
+  var mEdit: TMenuItem := mm.Add("Edit");
+  var miCut: TMenuItem := mEdit.Add("Cut Range");
+  miCut.OnClick := ActCutRange;
+  var miCopy: TMenuItem := mEdit.Add("Copy Range");
+  miCopy.OnClick := ActCopyRange;
+  var miPaste: TMenuItem := mEdit.Add("Paste Range");
+  miPaste.OnClick := ActPasteRange;
+  var miClear: TMenuItem := mEdit.Add("Clear Range");
+  miClear.OnClick := ActClearRange;
+
+  var mInstr: TMenuItem := mm.Add("Instrument");
+  var miInstrProps: TMenuItem := mInstr.Add("Instrument Properties...");
+  miInstrProps.OnClick := ActInstrProps;
+  var miLoadSample: TMenuItem := mInstr.Add("Load Sample...");
+  miLoadSample.OnClick := ActLoadSample;
+
+  var mMidi: TMenuItem := mm.Add("MIDI");
+  var miMidiSetup: TMenuItem := mMidi.Add("MIDI Setup...");
+  miMidiSetup.OnClick := ActMidiSetup;
+
+  var mSettings: TMenuItem := mm.Add("Settings");
+  var miPaula: TMenuItem := mSettings.Add("Playback: 4 Channel Paula");
+  miPaula.OnClick := ActModePaula;
+  var mi8ch: TMenuItem := mSettings.Add("Playback: 8 Channel OctaMED");
+  mi8ch.OnClick := ActMode8Ch;
+  var miMixer: TMenuItem := mSettings.Add("Playback: Modern Mixer");
+  miMixer.OnClick := ActModeMixer;
+  mSettings.AddSeparator();
+  var miPrefs: TMenuItem := mSettings.Add("Preferences...");
+  miPrefs.OnClick := ActNothing;
+  var miAbout: TMenuItem := mSettings.Add("About...");
+  miAbout.OnClick := ActNothing;
+
+  f.SetMenu(mm);
+}
+
+// ---- Fenster ---------------------------------------------------------------
+// Vegas ApplyLayout setzt Left/Top/Width/Height der Kinder DIREKT und nicht
+// ueber SetBounds — ein verschachtelter Container erfaehrt davon also nichts
+// und wuerde seine eigenen Kinder nie ausrichten. Deshalb zieht dieser
+// Handler die Layouts der Container nach, und die Menueleiste ihre Breite:
+// SetMenu setzt sie einmalig aus der damaligen Fensterbreite.
+fn OnMainResize(sender: TControl): void {
+  if (g_form == null) { return; }
+  if (g_form.Menu != 0) { g_form.Menu.Width := g_form.Width; }
+  if (g_lists != null) { g_lists.ApplyLayout(); }
+  g_form.Invalidate();
+}
+
+fn BuildMainWindow(app: TApplication): TForm {
+  var f: TForm := NewForm(WIN_W, WIN_H, "Paula");
+  g_form := f;
+  f.OnResize := OnMainResize;
+  BuildMenu(f);
+
+  // 0. Platzhalter in Hoehe der Menueleiste. Die Leiste selbst liegt als
+  //    Kind auf 0/0 und wird ZULETZT gezeichnet, ist aber am Layout nicht
+  //    beteiligt — ohne diesen Streifen legt sich die Infozeile darueber.
+  var menuspace: TOmedMenuSpacer := NewOmedMenuSpacer(f.MenuHeight());
+  f.AddChild(menuspace);
+
+  // 1. Infozeile oben
+  g_info := NewOmedInfoBar();
+  g_info.Attach(g_song);
+  g_info.ShowBlock(g_block_no);
+  g_info.Align := AL_TOP;
+  f.AddChild(g_info);
+
+  // 2. Transportzeile und Eingabezeile unten — vor dem Blockeditor, damit
+  //    ApplyLayout ihnen ihren Rand zuteilt.
+  var transport: TControl := new TControl();
+  transport.Height := 26;
+  transport.Align := AL_BOTTOM;
+  transport.Color := OmGrey();
+  f.AddChild(transport);
+  g_transport := transport;
+
+  var bPlaySong: TOmedButton := NewOmedButton("Play Song");
+  bPlaySong.Left := 4;
+  bPlaySong.Top := 3;
+  bPlaySong.Width := 88;
+  bPlaySong.OnClick := ActPlaySong;
+  transport.AddChild(bPlaySong);
+
+  var bPlayBlock: TOmedButton := NewOmedButton("Play Block");
+  bPlayBlock.Left := 96;
+  bPlayBlock.Top := 3;
+  bPlayBlock.Width := 92;
+  bPlayBlock.OnClick := ActPlayBlock;
+  transport.AddChild(bPlayBlock);
+
+  var bStop: TOmedButton := NewOmedButton("Stop");
+  bStop.Left := 192;
+  bStop.Top := 3;
+  bStop.Width := 56;
+  bStop.OnClick := ActStop;
+  transport.AddChild(bStop);
+
+  var bRec: TOmedButton := NewOmedButton("Rec");
+  bRec.Left := 252;
+  bRec.Top := 3;
+  bRec.Width := 48;
+  transport.AddChild(bRec);
+
+  g_editbar := NewOmedEditBar();
+  g_editbar.Attach(g_song);
+  g_editbar.Align := AL_BOTTOM;
+  f.AddChild(g_editbar);
+
+  // 3. Instrument- und Blockliste als unterer Streifen
+  var lists: TControl := new TControl();
+  lists.Height := 156;
+  lists.Align := AL_BOTTOM;
+  lists.Color := OmGrey();
+  f.AddChild(lists);
+  g_lists := lists;
+
+  g_instr := NewOmedList("INSTRUMENT / SAMPLE");
+  g_instr.Width := 300;
+  g_instr.Align := AL_LEFT;
+  lists.AddChild(g_instr);
+
+  g_blocks := NewOmedList("SONG / BLOCK LIST");
+  g_blocks.Align := AL_CLIENT;
+  lists.AddChild(g_blocks);
+
+  // 4. Blockeditor bekommt den Rest
+  g_grid := NewOmedGrid();
+  g_grid.Align := AL_CLIENT;
+  g_grid.Attach(g_song, g_song.BlockAt(g_block_no));
+  // Instrument, Oktave und Step der Eingabe stehen in der EditBar; das Grid
+  // liest sie von dort, statt sie zu spiegeln.
+  g_grid.Bar := g_editbar;
+  g_grid.OnNote := PreviewNote;
+  f.AddChild(g_grid);
+
+  g_blocks.OnSelect := ActSelectBlock;
+  g_instr.OnSelect := ActSelectInstr;
+  FillLists();
+
+  if (!app.ShowForm(f)) { return null; }
+  // Einmal von Hand, damit die Aufteilung schon beim ersten Bild stimmt und
+  // nicht erst nach der ersten Groessenaenderung.
+  f.ApplyLayout();
+  OnMainResize(f);
+
+  // Der Blockeditor ist die Eingabestelle des Programms: er hat den Fokus ab
+  // dem ersten Bild, sonst laufen die Pfeiltasten ins Leere, bis jemand
+  // hineinklickt.
+  f.Dispatcher.SetFocus(g_grid as TControl);
+  return f;
+}
+
+// Instrumentliste und Blockliste aus dem Song fuellen.
+fn FillLists(): void {
+  if (g_song == null) { return; }
+
+  g_instr.ClearEntries();
+  var i: int64 := 1;
+  while (i <= g_song.InstrCount) {
+    var ins: TInstrument := g_song.Instrument(i);
+    if (ins != null) { g_instr.AddEntry(i, ins.Name); }
+    i := i + 1;
+  }
+
+  g_blocks.ClearEntries();
+  var b: int64 := 0;
+  while (b < g_song.BlockCount) {
+    var blk: TBlock := g_song.BlockAt(b);
+    if (blk != null) { g_blocks.AddEntry(b, blk.Name); }
+    b := b + 1;
+  }
+}
+
+fn main(): int64 {
+  var app: TApplication := NewApplication(NewX11Backend());
+  if (!app.Ready) {
+    PrintStrLn("Paula: X11-Backend nicht verfuegbar (DISPLAY gesetzt?)");
+    return 1;
+  }
+
+  // Erst das Theme, dann die Controls: ein Control liest seine Farben beim
+  // Zeichnen, aber StyleType und Metriken stehen im Konstruktor fest.
+  if (!UsePaulaTheme("paula.theme")) {
+    PrintStrLn("Paula: paula.theme nicht gefunden - Anzeige im Vega-Standardtheme");
+  }
+
+  g_block_no := 0;
+  g_song := BuildDemoSong();
+
+  // Audio: Backend, Ausgabe und Mischpuffer. Faellt die Ausgabe aus (keine
+  // Soundkarte, kein ALSA), laeuft der Editor weiter — nur eben stumm. Ein
+  // Tracker, der ohne Audio gar nicht erst startet, waere beim Tippen
+  // nutzlos.
+  // Vorgabe ist der Paula-Modus: das Programm soll klingen wie das Original,
+  // und der moderne Mixer ist die Abweichung, die man bewusst waehlt.
+  SetPlaybackMode(MODE_PAULA);
+  g_pcm_frames := (OM_MIX_RATE * PREVIEW_MS) / 1000;
+  g_pcm := alloc(g_pcm_frames * 4);
+  g_audio := NewOmedAudio();
+  if (!g_audio.Open()) {
+    PrintStrLn("Paula: keine Audioausgabe - Vorhoeren bleibt stumm");
+  }
+
+  // Ein Tick ist beim langsamsten Tempo am laengsten; der Puffer wird einmal
+  // fuer diesen Fall angelegt und nie wieder angefasst.
+  g_tick_buf := alloc((OM_MIX_RATE / 4) * 4);
+  g_replay := NewReplayEngine();
+  g_replay.Attach(g_song, g_backend);
+  // Die MIDI-Ausgabe bleibt zu, bis jemand im MIDI Setup ein Geraet oeffnet.
+  // Ein Tracker, der beim Start in eine Geraetedatei schreibt, die es
+  // vielleicht gar nicht gibt, waere zudringlich.
+  g_midi := NewMidiOut();
+  g_replay.Midi := g_midi;
+
+  // Bis ein Sample geladen ist, bekommt jedes Instrument einen Ersatzklang.
+  // Sonst waere der Editor beim ersten Start lautlos, und man haette keinen
+  // Anhaltspunkt, ob Eingabe und Tonhoehe stimmen.
+  // Ersatzklaenge nach Art des Instruments: Bass, Pad und Lead halten ihren
+  // Ton ueber eine Schleife, solange die Note steht. Snare und Hi-Hats sind
+  // Schlagwerk — eine Schleife wuerde dort durchdroehnen.
+  var n: int64 := 1;
+  while (n <= 6) {
+    var ins: TInstrument := g_song.Instrument(n);
+    if (ins != null) {
+      if (ins.SampleData == 0) {
+        if (n == 1) {
+          MakeHeldSample(ins, 96, 40);                      // Bass, tief
+          ins.Hold := 10;                                   // knapp zwei Lines
+          ins.Decay := 6;
+        } else {
+          if (n == 5) {
+            MakeHeldSample(ins, 48, 40);                    // Pad, traegt lang
+            ins.Hold := 30;
+            ins.Decay := 2;
+          } else {
+            if (n == 6) {
+              MakeHeldSample(ins, 24, 40);                  // Lead
+              ins.Hold := 14;
+              ins.Decay := 5;
+            } else {
+              MakeSquareSample(ins, 32, 24);                // Snare, Hi-Hats
+            }
+          }
+        }
+      }
+    }
+    n := n + 1;
+  }
+
+  g_app := app;
+  var f: TForm := BuildMainWindow(app);
+  if (f == null) {
+    PrintStrLn("Paula: Fenster konnte nicht angelegt werden");
+    return 2;
+  }
+
+  // Der Timer laeuft immer; ohne laufendes Replay tut sein Handler nichts.
+  // 20 ms sind die 50 Ticks je Sekunde des PAL-Amiga bei Tempo 125.
+  g_timer := NewTimer(20);
+  g_timer.OnTimer := OnReplayTick;
+  g_timer.Start();
+  app.AddTimer(g_timer);
+
+  app.Run();
+  return 0;
+}

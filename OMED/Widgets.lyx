@@ -1,0 +1,1268 @@
+// OMED/Widgets.lyx — die Flaechen, die der Tracker selbst malt.
+//
+// Warum eigene Controls und nicht Vegas TPanel/TButton mit Theme-Eintraegen:
+// eine plastische Amiga-Flaeche braucht ZWEI verschiedene Kantenfarben
+// (hell oben/links, dunkel unten/rechts). Das Stylesheet kennt nur eine
+// borderColor — es kann faerben, aber keine Kante formen. Alles, was ohne
+// Doppelkante auskommt (Menueleiste, Listenauswahl, Rahmenfarben), bleibt
+// deshalb beim Theme; die plastischen Flaechen stehen hier.
+//
+// Alle Koordinaten in Paint sind control-lokal: der Canvas hat den Ursprung
+// des Controls bereits auf dem Stack.
+
+@description("OctaMED-Tracker - eigene Controls")
+@author("Andreas Roene")
+unit OMED.Widgets;
+
+import Vega.Types;
+import Vega.Canvas;
+import Vega.Control;
+import Vega.Font;
+import Vega.Theme;
+import Vega.Style;
+import Vega.Events;
+import Vega.Lists;
+import Vega.Strings;
+import OMED.Theme;
+import OMED.Song;
+
+// Zeilenhoehe im Raster: Fonthoehe + 1. Die eine Pixelzeile Luft ist der
+// Unterschied zwischen "Tabelle" und "Textbrei" — mehr waere modernes
+// Padding und wuerde die Zahl sichtbarer Lines senken.
+// Eine getippte Note soll man hoeren, nicht nur sehen. Das Grid kennt aber
+// weder Backend noch Audioausgabe — es meldet nur, welche Note auf welchem
+// Instrument angeschlagen wurde.
+pub type TOmedNoteEvent = fn(sender: TControl, note: int64, instr: int64): void;
+
+pub con OM_ROW_H: int64 := 17;
+pub con OM_CHAR_W: int64 := 8;
+pub con OM_GUTTER_CH: int64 := 3;   // "00 " — Zeilennummer plus ein Zeichen Luft
+
+// Gemeinsamer Textpuffer fuer Zellen und Zahlen. Ein Puffer je Zelle waere
+// pro Bild dreistellig viele Allokationen; das Raster wird oft neu gezeichnet.
+var _scratch: int64;
+var _scratch_ready: int64;
+
+fn Scratch(): int64 {
+  if (_scratch_ready == 0) {
+    _scratch := alloc(64);
+    _scratch_ready := 1;
+  }
+  return _scratch;
+}
+
+// Zahl rechtsbuendig dezimal in den Puffer, terminiert. Rueckgabe: Zeichen.
+fn IntToBuf(buf: int64, v: int64): int64 {
+  var n: int64 := v;
+  if (n < 0) { n := 0; }
+  var digits: int64 := 1;
+  var t: int64 := n / 10;
+  while (t > 0) { digits := digits + 1; t := t / 10; }
+  var i: int64 := digits;
+  poke8(buf + i, 0);
+  while (i > 0) {
+    i := i - 1;
+    poke8(buf + i, 48 + (n % 10));
+    n := n / 10;
+  }
+  return digits;
+}
+
+fn Hex2ToBuf(buf: int64, v: int64): void {
+  poke8(buf, HexDigit(v >> 4));
+  poke8(buf + 1, HexDigit(v));
+  poke8(buf + 2, 0);
+}
+
+// Text an Zeichenposition (col,row) einer 8x16-Zelle zeichnen.
+fn TextAt(canvas: TCanvas, col: int64, row: int64, s: pchar, c: TColor): void {
+  DefaultFont().DrawText(canvas, col * OM_CHAR_W, row * OM_ROW_H, s, c);
+}
+
+// ============================================================================
+// TOmedMenuSpacer — der Streifen unter der Menueleiste
+// ============================================================================
+// Vegas Menueleiste haengt als Kind auf 0/0, nimmt am Layout aber nicht teil:
+// sie wird zuletzt als Overlay gezeichnet. Ohne einen Platzhalter derselben
+// Hoehe legt die Infozeile sich darueber.
+//
+// Der Platzhalter darf allerdings keine Maus annehmen. Er liegt genau auf der
+// Leiste, und TControl.HitTest liefert das ZULETZT eingehaengte Kind — der
+// Platzhalter wuerde also jeden Klick auf das Menue abfangen, und die Leiste
+// klappte nie auf. Deshalb ist er fuer die Maus durchsichtig.
+pub type TOmedMenuSpacer = class extends TControl {
+  fn Create(h: int64): void {
+    self.Init();
+    self.Height := h;
+    self.Align := AL_TOP;
+    self.Color := ClTransparent();
+    self.CanFocus := false;
+  }
+
+  override fn HitTest(x: int64, y: int64): TControl {
+    return null;
+  }
+}
+
+pub fn NewOmedMenuSpacer(h: int64): TOmedMenuSpacer {
+  return new TOmedMenuSpacer(h);
+}
+
+// ============================================================================
+// TOmedButton — plastischer Knopf
+// ============================================================================
+// Gedrueckt wird die Kante getauscht und der Text um einen Pixel versetzt.
+// Genau so verhielten sich GadTools-Knoepfe, und ohne den Versatz fuehlt sich
+// ein Klick "flach" an, auch wenn die Farben stimmen.
+pub type TOmedButton = class extends TControl {
+  fn Create(caption: pchar): void {
+    self.Init();
+    self.StyleType := StyleRegistry().TypeId("button");
+    self.Caption := caption;
+    self.CanFocus := false;
+    self.Height := 20;
+  }
+
+  override fn Paint(canvas: TCanvas): void {
+    var r: TRect := self.ClientRect();
+    var face: TColor := OmGrey();
+    if (self.Hovered) { face := RGB(180, 180, 180); }
+    if (self.Pressed) { face := OmGreyDark(); }
+
+    canvas.FillRect(r, face);
+    if (self.Pressed) { BevelLowered(canvas, r); }
+    else { BevelRaised(canvas, r); }
+
+    if (self.Caption != 0) {
+      var f: TFont := DefaultFont();
+      var tw: int64 := f.TextWidth(self.Caption);
+      var tx: int64 := (RectWidth(r) - tw) / 2;
+      var ty: int64 := (RectHeight(r) - f.TextHeight()) / 2;
+      if (self.Pressed) { tx := tx + 1; ty := ty + 1; }
+      if (tx < 2) { tx := 2; }
+      f.DrawText(canvas, tx, ty, self.Caption, OmBlack());
+    }
+  }
+}
+
+pub fn NewOmedButton(caption: pchar): TOmedButton {
+  return new TOmedButton(caption);
+}
+
+// ============================================================================
+// TOmedInfoBar — SONG / BLOCK / TEMPO / LPB
+// ============================================================================
+// Kein Container mit Labels darin, sondern eine Flaeche, die ihre Zeile
+// selbst setzt: die Spalten sollen an Zeichenpositionen sitzen, nicht an
+// Pixelabstaenden, sonst wandert die Zeile bei jeder Textaenderung.
+pub type TOmedInfoBar = class extends TControl {
+  Song: TSong;
+  BlockNo: int64;
+
+  fn Create(): void {
+    self.Init();
+    self.StyleType := StyleRegistry().TypeId("panel");
+    self.Song := null;
+    self.BlockNo := 0;
+    self.Height := 20;
+  }
+
+  fn Attach(s: TSong): void {
+    self.Song := s;
+    self.Invalidate();
+  }
+
+  fn ShowBlock(no: int64): void {
+    self.BlockNo := no;
+    self.Invalidate();
+  }
+
+  override fn Paint(canvas: TCanvas): void {
+    var r: TRect := self.ClientRect();
+    FillRaised(canvas, r, OmGrey());
+    if (self.Song == null) { return; }
+
+    var f: TFont := DefaultFont();
+    var y: int64 := (RectHeight(r) - f.TextHeight()) / 2;
+    var buf: int64 := Scratch();
+    var ink: TColor := OmBlack();
+
+    f.DrawText(canvas, 4, y, "SONG:", ink);
+    f.DrawText(canvas, 4 + 6 * OM_CHAR_W, y, self.Song.Name, ink);
+
+    var x: int64 := 4 + 30 * OM_CHAR_W;
+    f.DrawText(canvas, x, y, "BLOCK:", ink);
+    Hex2ToBuf(buf, self.BlockNo);
+    f.DrawText(canvas, x + 7 * OM_CHAR_W, y, buf as pchar, ink);
+
+    x := x + 12 * OM_CHAR_W;
+    f.DrawText(canvas, x, y, "TEMPO:", ink);
+    var n: int64 := IntToBuf(buf, self.Song.Tempo);
+    f.DrawText(canvas, x + 7 * OM_CHAR_W, y, buf as pchar, ink);
+
+    x := x + 13 * OM_CHAR_W;
+    f.DrawText(canvas, x, y, "TPL:", ink);
+    n := IntToBuf(buf, self.Song.Tpl);
+    f.DrawText(canvas, x + 5 * OM_CHAR_W, y, buf as pchar, ink);
+
+    x := x + 9 * OM_CHAR_W;
+    f.DrawText(canvas, x, y, "LPB:", ink);
+    n := IntToBuf(buf, self.Song.Lpb);
+    f.DrawText(canvas, x + 5 * OM_CHAR_W, y, buf as pchar, ink);
+  }
+}
+
+pub fn NewOmedInfoBar(): TOmedInfoBar {
+  return new TOmedInfoBar();
+}
+
+// ============================================================================
+// TOmedEditBar — Instr / Octave / Step
+// ============================================================================
+pub type TOmedEditBar = class extends TControl {
+  Song: TSong;
+  Instr: int64;    // 1..3F, aktuelles Eingabeinstrument
+  Octave: int64;   // 1..6
+  Step: int64;     // Cursor-Vorschub nach einer Eingabe
+
+  fn Create(): void {
+    self.Init();
+    self.StyleType := StyleRegistry().TypeId("panel");
+    self.Song := null;
+    self.Instr := 1;
+    self.Octave := 3;
+    self.Step := 1;
+    self.Height := 20;
+  }
+
+  fn Attach(s: TSong): void {
+    self.Song := s;
+    self.Invalidate();
+  }
+
+  override fn Paint(canvas: TCanvas): void {
+    var r: TRect := self.ClientRect();
+    FillRaised(canvas, r, OmGrey());
+
+    var f: TFont := DefaultFont();
+    var y: int64 := (RectHeight(r) - f.TextHeight()) / 2;
+    var buf: int64 := Scratch();
+    var ink: TColor := OmBlack();
+
+    f.DrawText(canvas, 4, y, "Instr:", ink);
+    Hex2ToBuf(buf, self.Instr);
+    f.DrawText(canvas, 4 + 7 * OM_CHAR_W, y, buf as pchar, ink);
+
+    if (self.Song != null) {
+      var ins: TInstrument := self.Song.Instrument(self.Instr);
+      if (ins != null) {
+        f.DrawText(canvas, 4 + 10 * OM_CHAR_W, y, ins.Name, ink);
+      }
+    }
+
+    var x: int64 := 4 + 30 * OM_CHAR_W;
+    f.DrawText(canvas, x, y, "Octave:", ink);
+    var n: int64 := IntToBuf(buf, self.Octave);
+    f.DrawText(canvas, x + 8 * OM_CHAR_W, y, buf as pchar, ink);
+
+    x := x + 12 * OM_CHAR_W;
+    f.DrawText(canvas, x, y, "Step:", ink);
+    n := IntToBuf(buf, self.Step);
+    f.DrawText(canvas, x + 6 * OM_CHAR_W, y, buf as pchar, ink);
+  }
+}
+
+pub fn NewOmedEditBar(): TOmedEditBar {
+  return new TOmedEditBar();
+}
+
+// ============================================================================
+// TOmedGrid — der Blockeditor
+// ============================================================================
+// Das ist nicht "eine Tabelle in der Anwendung", das ist das Instrument. Die
+// Zellen sitzen deshalb auf einem starren Zeichenraster (8x17), nicht auf
+// gemessenen Textbreiten: eine Spalte, die je Inhalt wandert, macht das
+// Tippen unmoeglich.
+//
+// Phase 2 bringt Cursor und Scrollen: der Cursor steht auf genau einem Feld
+// einer Zelle (Note, Instrument-Nibble, Command, Level), nicht auf der ganzen
+// Zelle — sonst waere in Phase 3 nicht bestimmbar, wohin ein Tastendruck
+// schreibt. Das Tippen selbst kommt in Phase 3.
+pub type TOmedGrid = class extends TControl {
+  Song: TSong;
+  Block: TBlock;
+  TopLine: int64;     // erste sichtbare Line
+  LeftTrack: int64;   // erster sichtbarer Track
+  CurLine: int64;
+  CurTrack: int64;
+  CurCol: int64;      // Cursorfeld innerhalb der Zelle, siehe ColOffset
+  // Markierter Bereich. Der Anker ist die Stelle, an der die Markierung
+  // begonnen hat; das andere Ende ist immer der Cursor. So bleibt beim
+  // Erweitern nichts nachzuhalten, und die Markierung folgt dem, was man
+  // gerade tut.
+  SelActive: bool;
+  SelLine: int64;
+  SelTrack: int64;
+
+  Bar: TOmedEditBar;  // Instr/Octave/Step der Eingabe — eine Quelle, nicht zwei
+  OnCursorMove: TNotifyEvent;
+  OnNote: TOmedNoteEvent;
+  ExtCmd: bool;       // zweistellige Commandanzeige (MMD1/MMD2)
+  HexLines: bool;     // Zeilennummern hexadezimal
+  EditMode: bool;     // Space schaltet um: nur hier schreibt Tippen
+
+  fn Create(): void {
+    self.Init();
+    self.StyleType := StyleRegistry().TypeId("grid");
+    self.Song := null;
+    self.Block := null;
+    self.TopLine := 0;
+    self.LeftTrack := 0;
+    self.CurLine := 0;
+    self.CurTrack := 0;
+    self.CurCol := 0;
+    self.SelActive := false;
+    self.SelLine := 0;
+    self.SelTrack := 0;
+    self.Bar := null;
+    self.OnCursorMove := 0;
+    self.OnNote := 0;
+    self.ExtCmd := false;
+    self.HexLines := true;
+    self.EditMode := false;
+    self.CanFocus := true;
+  }
+
+  fn Attach(s: TSong, b: TBlock): void {
+    self.Song := s;
+    self.Block := b;
+    self.TopLine := 0;
+    self.LeftTrack := 0;
+    self.CurLine := 0;
+    self.CurTrack := 0;
+    self.CurCol := 0;
+    self.Invalidate();
+  }
+
+  // Breite einer Trackspalte in Pixeln, inklusive Trennstrich.
+  fn TrackWidth(): int64 {
+    return (CellTextWidth(self.ExtCmd) + 1) * OM_CHAR_W;
+  }
+
+  fn GutterWidth(): int64 {
+    return OM_GUTTER_CH * OM_CHAR_W;
+  }
+
+  fn VisibleLines(): int64 {
+    var n: int64 := (self.Height - 2) / OM_ROW_H;
+    if (n < 1) { return 1; }
+    return n;
+  }
+
+  // Wie viele Tracks passen nebeneinander? Ein halb sichtbarer Track ist
+  // schlimmer als einer weniger — im Tracker liest man ganze Spalten.
+  fn VisibleTracks(): int64 {
+    if (self.Block == null) { return 0; }
+    var avail: int64 := self.Width - 2 - self.GutterWidth();
+    var n: int64 := avail / self.TrackWidth();
+    if (n < 1) { n := 1; }
+    if (n > self.Block.Tracks) { n := self.Block.Tracks; }
+    return n;
+  }
+
+  // ---- Cursorfelder -------------------------------------------------------
+  // Zellentext "C-3 01 000": 0..2 Note, 3 Luft, 4..5 Instrument, 6 Luft,
+  // 7 Command, 8..9 Level. Mit ExtCmd ist das Command zweistellig (7..8),
+  // das Level rueckt auf 9..10.
+  //
+  // Der Cursor haengt an diesem Feldraster und nicht an einer Zeichenspalte:
+  // ein Cursor, der auch auf den Leerzeichen stehen kann, laesst in Phase 3
+  // offen, welches Feld eine Taste trifft.
+  fn ColCount(): int64 {
+    if (self.ExtCmd) { return 7; }
+    return 6;
+  }
+
+  fn ColOffset(col: int64): int64 {
+    if (col <= 0) { return 0; }
+    if (col == 1) { return 4; }
+    if (col == 2) { return 5; }
+    return 7 + (col - 3);
+  }
+
+  fn ColWidth(col: int64): int64 {
+    if (col <= 0) { return 3; }
+    return 1;
+  }
+
+  // Zeichenspalte -> Cursorfeld. Ein Klick auf ein Leerzeichen faellt auf das
+  // Feld links davon, nicht ins Leere.
+  fn ColAtChar(ch: int64): int64 {
+    if (ch < 4) { return 0; }
+    if (ch < 5) { return 1; }
+    if (ch < 7) { return 2; }
+    var c: int64 := 3 + (ch - 7);
+    if (c >= self.ColCount()) { c := self.ColCount() - 1; }
+    return c;
+  }
+
+  // ---- Cursorbewegung -----------------------------------------------------
+
+  fn ClampCursor(): void {
+    if (self.Block == null) { return; }
+    if (self.CurLine < 0) { self.CurLine := 0; }
+    if (self.CurLine >= self.Block.Lines) { self.CurLine := self.Block.Lines - 1; }
+    if (self.CurTrack < 0) { self.CurTrack := 0; }
+    if (self.CurTrack >= self.Block.Tracks) { self.CurTrack := self.Block.Tracks - 1; }
+    if (self.CurCol < 0) { self.CurCol := 0; }
+    if (self.CurCol >= self.ColCount()) { self.CurCol := self.ColCount() - 1; }
+  }
+
+  // Das Sichtfenster folgt dem Cursor, nicht umgekehrt: gescrollt wird nur so
+  // weit, dass der Cursor gerade wieder sichtbar ist. Ein Sprung, der den
+  // Cursor in die Mitte zieht, macht das Blaettern unruhig.
+  fn EnsureVisible(): void {
+    if (self.Block == null) { return; }
+
+    var n: int64 := self.VisibleLines();
+    if (self.CurLine < self.TopLine) { self.TopLine := self.CurLine; }
+    if (self.CurLine > self.TopLine + n - 1) { self.TopLine := self.CurLine - n + 1; }
+    var maxTop: int64 := self.Block.Lines - n;
+    if (maxTop < 0) { maxTop := 0; }
+    if (self.TopLine > maxTop) { self.TopLine := maxTop; }
+    if (self.TopLine < 0) { self.TopLine := 0; }
+
+    var nt: int64 := self.VisibleTracks();
+    if (self.CurTrack < self.LeftTrack) { self.LeftTrack := self.CurTrack; }
+    if (self.CurTrack > self.LeftTrack + nt - 1) {
+      self.LeftTrack := self.CurTrack - nt + 1;
+    }
+    var maxLeft: int64 := self.Block.Tracks - nt;
+    if (maxLeft < 0) { maxLeft := 0; }
+    if (self.LeftTrack > maxLeft) { self.LeftTrack := maxLeft; }
+    if (self.LeftTrack < 0) { self.LeftTrack := 0; }
+  }
+
+  fn CursorChanged(): void {
+    self.ClampCursor();
+    self.EnsureVisible();
+    self.Invalidate();
+    if (self.OnCursorMove != 0) {
+      self.OnCursorMove(self as TControl);
+    }
+  }
+
+  pub fn SetCursor(line: int64, track: int64, col: int64): void {
+    self.CurLine := line;
+    self.CurTrack := track;
+    self.CurCol := col;
+    self.CursorChanged();
+  }
+
+  // Auf und Ab laufen im Block um. Das ist OctaMED-Verhalten und praktisch:
+  // die letzte Line eines Blocks liegt musikalisch neben der ersten.
+  fn MoveLine(delta: int64): void {
+    if (self.Block == null) { return; }
+    var lines: int64 := self.Block.Lines;
+    if (lines < 1) { return; }
+    var l: int64 := (self.CurLine + delta) % lines;
+    if (l < 0) { l := l + lines; }
+    self.CurLine := l;
+    self.CursorChanged();
+  }
+
+  // Seitwaerts wandert der Cursor ueber die Trackgrenze in den Nachbartrack,
+  // wie in einer Textzeile ueber den Zeilenrand. Am Blockrand steht er still.
+  fn MoveCol(delta: int64): void {
+    if (self.Block == null) { return; }
+    var c: int64 := self.CurCol + delta;
+    var ncols: int64 := self.ColCount();
+    while (c < 0) {
+      if (self.CurTrack <= 0) { c := 0; }
+      else {
+        self.CurTrack := self.CurTrack - 1;
+        c := c + ncols;
+      }
+    }
+    while (c >= ncols) {
+      if (self.CurTrack >= self.Block.Tracks - 1) { c := ncols - 1; }
+      else {
+        self.CurTrack := self.CurTrack + 1;
+        c := c - ncols;
+      }
+    }
+    self.CurCol := c;
+    self.CursorChanged();
+  }
+
+  fn MoveTrack(delta: int64): void {
+    self.CurTrack := self.CurTrack + delta;
+    self.CursorChanged();
+  }
+
+  // Reines Blaettern ohne Cursor: das Rad bewegt die Ansicht, nicht die
+  // Eingabestelle — sonst verliert man beim Nachschauen seinen Platz.
+  fn ScrollLines(delta: int64): void {
+    if (self.Block == null) { return; }
+    var maxTop: int64 := self.Block.Lines - self.VisibleLines();
+    if (maxTop < 0) { maxTop := 0; }
+    var t: int64 := self.TopLine + delta;
+    if (t < 0) { t := 0; }
+    if (t > maxTop) { t := maxTop; }
+    if (t == self.TopLine) { return; }
+    self.TopLine := t;
+    self.Invalidate();
+  }
+
+  override fn DoKeyDown(key: int64, modifiers: int64): void {
+    if (!self.IsEnabled()) { return; }
+    if (self.Block == null) { return; }
+
+    // Mit Shift wandert der Cursor UND die Markierung waechst mit; ohne Shift
+    // faellt sie weg. Genau so verhaelt sich jede Textauswahl, und der Griff
+    // sitzt deshalb ohne Nachdenken.
+    var extend: bool := (modifiers & MOD_SHIFT) != 0;
+    if (extend) { self.BeginSelection(); }
+    else {
+      if (key == KEY_UP) { self.ClearSelection(); }
+      if (key == KEY_DOWN) { self.ClearSelection(); }
+      if (key == KEY_LEFT) { self.ClearSelection(); }
+      if (key == KEY_RIGHT) { self.ClearSelection(); }
+      if (key == KEY_HOME) { self.ClearSelection(); }
+      if (key == KEY_END) { self.ClearSelection(); }
+      if (key == KEY_PAGE_UP) { self.ClearSelection(); }
+      if (key == KEY_PAGE_DOWN) { self.ClearSelection(); }
+    }
+
+    if (key == KEY_UP) { self.MoveLine(-1); return; }
+    if (key == KEY_DOWN) { self.MoveLine(1); return; }
+    // Strg+Links/Rechts springt einen ganzen Track weiter. In OctaMED lag das
+    // auf Tab — die Taste gehoert in Vega aber der Fokusverwaltung und
+    // erreicht ein Control nie (TDispatcher.HandleKeyDown).
+    if (key == KEY_LEFT) {
+      if ((modifiers & MOD_CTRL) != 0) { self.MoveTrack(-1); return; }
+      self.MoveCol(-1);
+      return;
+    }
+    if (key == KEY_RIGHT) {
+      if ((modifiers & MOD_CTRL) != 0) { self.MoveTrack(1); return; }
+      self.MoveCol(1);
+      return;
+    }
+
+    // Seitenweise: ein Taktschlagblock (LPB * 4) statt einer festen Zahl —
+    // so landet der Cursor beim Blaettern wieder auf einem Taktschlag.
+    if (key == KEY_PAGE_UP) { self.MoveLine(-self.PageStep()); return; }
+    if (key == KEY_PAGE_DOWN) { self.MoveLine(self.PageStep()); return; }
+
+    if (key == KEY_HOME) {
+      if ((modifiers & MOD_CTRL) != 0) { self.SetCursor(0, 0, 0); return; }
+      self.SetCursor(0, self.CurTrack, self.CurCol);
+      return;
+    }
+    if (key == KEY_END) {
+      self.SetCursor(self.Block.Lines - 1, self.CurTrack, self.CurCol);
+      return;
+    }
+
+    // Loeschen und Einfuegen. Beides wirkt nur im Editiermodus — sonst
+    // loescht ein Tastendruck beim Durchblaettern eine Note.
+    if (self.EditMode) {
+      if (key == KEY_DELETE) {
+        self.Block.ClearCell(self.CurLine, self.CurTrack);
+        self.AdvanceStep();
+        return;
+      }
+      if (key == KEY_BACKSPACE) {
+        self.Block.ClearCell(self.CurLine, self.CurTrack);
+        self.MoveLine(-1);
+        return;
+      }
+      if (key == KEY_RETURN) {
+        // Mit Shift die Line loeschen, ohne sie einfuegen: eine Taste, zwei
+        // Richtungen — so wie Einfuegen und Loeschen zusammengehoeren.
+        if ((modifiers & MOD_SHIFT) != 0) { self.Block.DeleteLine(self.CurLine); }
+        else { self.Block.InsertLine(self.CurLine); }
+        self.Invalidate();
+        return;
+      }
+    }
+
+    // Space schaltet den Editiermodus um. Der Modus ist am Cursorfeld zu
+    // sehen (orange statt dunkelblau) — ein Editor, dem man nicht ansieht, ob
+    // er schreibt, verliert frueher oder spaeter eine Note.
+    if (key == KEY_ESCAPE) {
+      self.ClearSelection();
+      return;
+    }
+
+    if (key == KEY_SPACE) {
+      self.EditMode := !self.EditMode;
+      self.Invalidate();
+      return;
+    }
+
+    if (self.OnKeyDown != 0) {
+      self.OnKeyDown(self as TControl, key, modifiers);
+    }
+  }
+
+  fn PageStep(): int64 {
+    var lpb: int64 := 4;
+    if (self.Song != null) { lpb := self.Song.Lpb; }
+    if (lpb < 1) { lpb := 1; }
+    return lpb * 4;
+  }
+
+  // Ziehen mit gedrueckter Taste markiert. Der Anker steht schon (er wurde
+  // beim Druecken gesetzt), also genuegt es, den Cursor mitzufuehren.
+  override fn DoMouseMove(x: int64, y: int64, button: int64): void {
+    if (!self.IsEnabled()) { return; }
+    if (self.Block == null) { return; }
+    if (!self.Pressed) { return; }
+
+    var row: int64 := (y - 1) / OM_ROW_H;
+    if (row < 0) { row := 0; }
+    var line: int64 := self.TopLine + row;
+
+    var gutter: int64 := self.GutterWidth();
+    var tw: int64 := self.TrackWidth();
+    var cx: int64 := x - 1 - gutter;
+    if (cx < 0) { cx := 0; }
+    var track: int64 := self.LeftTrack + (cx / tw);
+
+    if (line == self.CurLine) {
+      if (track == self.CurTrack) { return; }
+    }
+    self.SelActive := true;
+    self.SetCursor(line, track, self.CurCol);
+  }
+
+  override fn DoMouseWheel(delta: int64): void {
+    if (!self.IsEnabled()) { return; }
+    self.ScrollLines(-delta * 3);
+  }
+
+  // Ein Klick setzt den Cursor auf das getroffene Feld. Den Fokus holt der
+  // Dispatcher bereits, weil CanFocus gesetzt ist.
+  override fn DoMouseDown(x: int64, y: int64, button: int64): void {
+    if (!self.IsEnabled()) { return; }
+    if (self.Block == null) { return; }
+
+    var row: int64 := (y - 1) / OM_ROW_H;
+    if (row < 0) { row := 0; }
+    var line: int64 := self.TopLine + row;
+
+    var gutter: int64 := self.GutterWidth();
+    var tw: int64 := self.TrackWidth();
+    var cx: int64 := x - 1 - gutter;
+    if (cx < 0) { cx := 0; }
+    var track: int64 := self.LeftTrack + (cx / tw);
+    var ch: int64 := (cx % tw) / OM_CHAR_W;
+
+    // Ein Klick beendet eine alte Markierung und setzt den Anker neu; das
+    // Ziehen darunter macht daraus einen Bereich.
+    //
+    // Pressed setzt sonst TControl.DoMouseDown — das hier ueberschreibt es und
+    // ruft die Vorgabe nicht auf, also muss der Druckzustand von Hand stehen.
+    // Ohne ihn wuesste DoMouseMove nicht, dass gezogen wird.
+    self.Pressed := true;
+    self.SelActive := false;
+    self.SetCursor(line, track, self.ColAtChar(ch));
+    self.SelLine := self.CurLine;
+    self.SelTrack := self.CurTrack;
+
+    if (self.OnMouseDown != 0) {
+      self.OnMouseDown(self as TControl, x, y, button);
+    }
+  }
+
+  // ---- Markierung ---------------------------------------------------------
+  // Die Grenzen werden bei jeder Abfrage aus Anker und Cursor gerechnet, statt
+  // sie beim Setzen zu sortieren: sonst muesste jede Cursorbewegung daran
+  // denken, und genau das vergisst man irgendwann.
+  fn SelTop(): int64 {
+    if (self.CurLine < self.SelLine) { return self.CurLine; }
+    return self.SelLine;
+  }
+
+  fn SelBottom(): int64 {
+    if (self.CurLine > self.SelLine) { return self.CurLine; }
+    return self.SelLine;
+  }
+
+  fn SelLeft(): int64 {
+    if (self.CurTrack < self.SelTrack) { return self.CurTrack; }
+    return self.SelTrack;
+  }
+
+  fn SelRight(): int64 {
+    if (self.CurTrack > self.SelTrack) { return self.CurTrack; }
+    return self.SelTrack;
+  }
+
+  fn InSelection(line: int64, track: int64): bool {
+    if (!self.SelActive) { return false; }
+    if (line < self.SelTop()) { return false; }
+    if (line > self.SelBottom()) { return false; }
+    if (track < self.SelLeft()) { return false; }
+    if (track > self.SelRight()) { return false; }
+    return true;
+  }
+
+  // Markierung beginnen, falls noch keine laeuft. Der Anker bleibt dort, wo
+  // der Cursor beim ersten Shift-Druck stand.
+  fn BeginSelection(): void {
+    if (self.SelActive) { return; }
+    self.SelActive := true;
+    self.SelLine := self.CurLine;
+    self.SelTrack := self.CurTrack;
+  }
+
+  pub fn ClearSelection(): void {
+    if (!self.SelActive) { return; }
+    self.SelActive := false;
+    self.Invalidate();
+  }
+
+  // Der markierte Bereich als eigener Block — das ist zugleich das Format der
+  // Zwischenablage. Ein Ausschnitt IST ein kleiner Block, und dann kann ihn
+  // Paste ohne Umrechnung wieder einsetzen.
+  pub fn CopySelection(): TBlock {
+    if (self.Block == null) { return null; }
+    var l0: int64 := self.CurLine;
+    var l1: int64 := self.CurLine;
+    var t0: int64 := self.CurTrack;
+    var t1: int64 := self.CurTrack;
+    if (self.SelActive) {
+      l0 := self.SelTop();
+      l1 := self.SelBottom();
+      t0 := self.SelLeft();
+      t1 := self.SelRight();
+    }
+
+    var clip: TBlock := NewBlock(t1 - t0 + 1, l1 - l0 + 1);
+    clip.Name := "Clip";
+    var line: int64 := l0;
+    while (line <= l1) {
+      var track: int64 := t0;
+      while (track <= t1) {
+        clip.PutCell(line - l0, track - t0, self.Block.Cell(line, track));
+        track := track + 1;
+      }
+      line := line + 1;
+    }
+    return clip;
+  }
+
+  pub fn ClearRange(): void {
+    if (self.Block == null) { return; }
+    var l0: int64 := self.CurLine;
+    var l1: int64 := self.CurLine;
+    var t0: int64 := self.CurTrack;
+    var t1: int64 := self.CurTrack;
+    if (self.SelActive) {
+      l0 := self.SelTop();
+      l1 := self.SelBottom();
+      t0 := self.SelLeft();
+      t1 := self.SelRight();
+    }
+    var line: int64 := l0;
+    while (line <= l1) {
+      var track: int64 := t0;
+      while (track <= t1) {
+        self.Block.ClearCell(line, track);
+        track := track + 1;
+      }
+      line := line + 1;
+    }
+    self.Invalidate();
+  }
+
+  // Einsetzen ab dem Cursor. Was ueber den Blockrand hinausragt, faellt weg —
+  // ein Paste, das den Block heimlich vergroessert, waere schlimmer als eines,
+  // das sichtbar abschneidet.
+  pub fn PasteAt(clip: TBlock): void {
+    if (self.Block == null) { return; }
+    if (clip == null) { return; }
+    var line: int64 := 0;
+    while (line < clip.Lines) {
+      var track: int64 := 0;
+      while (track < clip.Tracks) {
+        self.Block.PutCell(self.CurLine + line, self.CurTrack + track,
+                           clip.Cell(line, track));
+        track := track + 1;
+      }
+      line := line + 1;
+    }
+    self.Invalidate();
+  }
+
+  // Noten im markierten Bereich verschieben. Instrument, Command und
+  // Datenbyte bleiben unangetastet — transponiert wird die Tonhoehe, nicht
+  // die Spielanweisung. Leere Zellen bleiben leer, und was aus dem Bereich
+  // 1..72 (C-1 bis B-6) fiele, bleibt stehen: eine Note, die beim
+  // Transponieren heimlich auf C-1 zusammensackt, waere schlimmer als eine,
+  // die sich nicht bewegt.
+  pub fn TransposeRange(semitones: int64): void {
+    if (self.Block == null) { return; }
+    var l0: int64 := self.CurLine;
+    var l1: int64 := self.CurLine;
+    var t0: int64 := self.CurTrack;
+    var t1: int64 := self.CurTrack;
+    if (self.SelActive) {
+      l0 := self.SelTop();
+      l1 := self.SelBottom();
+      t0 := self.SelLeft();
+      t1 := self.SelRight();
+    }
+
+    var line: int64 := l0;
+    while (line <= l1) {
+      var track: int64 := t0;
+      while (track <= t1) {
+        var cell: int64 := self.Block.Cell(line, track);
+        var note: int64 := CellNote(cell);
+        if (note > 0) {
+          var n: int64 := note + semitones;
+          if (n >= 1) {
+            if (n <= 72) {
+              self.Block.PutCell(line, track,
+                                 CellPack(n, CellInstr(cell), CellCmd(cell),
+                                          CellLevel(cell)));
+            }
+          }
+        }
+        track := track + 1;
+      }
+      line := line + 1;
+    }
+    self.Invalidate();
+  }
+
+  // ---- Eingabe (Phase 3) --------------------------------------------------
+  // Die Werte der Eingabe (Instrument, Oktave, Step) stehen in der EditBar und
+  // werden von dort gelesen, nicht im Grid gespiegelt: zwei Kopien desselben
+  // Wertes laufen frueher oder spaeter auseinander, und dann schreibt der
+  // Editor ein anderes Instrument, als die Zeile darunter anzeigt.
+  fn InInstr(): int64 {
+    if (self.Bar == null) { return 1; }
+    return self.Bar.Instr;
+  }
+
+  fn InOctave(): int64 {
+    if (self.Bar == null) { return 3; }
+    return self.Bar.Octave;
+  }
+
+  fn InStep(): int64 {
+    if (self.Bar == null) { return 1; }
+    return self.Bar.Step;
+  }
+
+  // Klassisches Zwei-Reihen-Layout: untere Reihe ab der Basisoktave, obere
+  // Reihe eine Oktave darueber. Rueckgabe: Halbton 0..11 plus 12 fuer die
+  // obere Reihe, sonst -1.
+  fn NoteKey(cp: int64): int64 {
+    // untere Reihe: Z S X D C V G B H N J M
+    if (cp == 122) { return 0; }    // z  C
+    if (cp == 115) { return 1; }    // s  C#
+    if (cp == 120) { return 2; }    // x  D
+    if (cp == 100) { return 3; }    // d  D#
+    if (cp == 99) { return 4; }     // c  E
+    if (cp == 118) { return 5; }    // v  F
+    if (cp == 103) { return 6; }    // g  F#
+    if (cp == 98) { return 7; }     // b  G
+    if (cp == 104) { return 8; }    // h  G#
+    if (cp == 110) { return 9; }    // n  A
+    if (cp == 106) { return 10; }   // j  A#
+    if (cp == 109) { return 11; }   // m  B
+    // obere Reihe: Q 2 W 3 E R 5 T 6 Y 7 U
+    if (cp == 113) { return 12; }   // q  C
+    if (cp == 50) { return 13; }    // 2  C#
+    if (cp == 119) { return 14; }   // w  D
+    if (cp == 51) { return 15; }    // 3  D#
+    if (cp == 101) { return 16; }   // e  E
+    if (cp == 114) { return 17; }   // r  F
+    if (cp == 53) { return 18; }    // 5  F#
+    if (cp == 116) { return 19; }   // t  G
+    if (cp == 54) { return 20; }    // 6  G#
+    if (cp == 121) { return 21; }   // y  A
+    if (cp == 55) { return 22; }    // 7  A#
+    if (cp == 117) { return 23; }   // u  B
+    return -1;
+  }
+
+  // Hexziffer aus einem Zeichen, gross oder klein geschrieben; -1 wenn keine.
+  fn HexKey(cp: int64): int64 {
+    if (cp >= 48) { if (cp <= 57) { return cp - 48; } }
+    if (cp >= 97) { if (cp <= 102) { return cp - 97 + 10; } }
+    if (cp >= 65) { if (cp <= 70) { return cp - 65 + 10; } }
+    return -1;
+  }
+
+  // Nach jeder Eingabe rueckt der Cursor um Step Lines vor. Step = 0 laesst
+  // ihn stehen — so tippt man Akkorde uebereinander.
+  fn AdvanceStep(): void {
+    var st: int64 := self.InStep();
+    if (st == 0) { self.CursorChanged(); return; }
+    self.MoveLine(st);
+  }
+
+  // Notennummer aus einer Tastenreihe: die obere Reihe liegt eine Oktave
+  // hoeher, deshalb steckt der Oktavversatz im Halbtonwert.
+  fn NoteOf(sem: int64): int64 {
+    var oct: int64 := self.InOctave() + (sem / 12);
+    var st: int64 := sem % 12;
+    if (oct < 1) { oct := 1; }
+    if (oct > 6) { oct := 6; }
+    return (oct - 1) * 12 + st + 1;
+  }
+
+  fn Preview(note: int64): void {
+    if (self.OnNote == 0) { return; }
+    self.OnNote(self as TControl, note, self.InInstr());
+  }
+
+  fn PutNote(sem: int64): void {
+    var note: int64 := self.NoteOf(sem);
+
+    var cell: int64 := self.Block.Cell(self.CurLine, self.CurTrack);
+    var ins: int64 := CellInstr(cell);
+    // Instrument 00 heisst "kein Wechsel" — eine neue Note bekommt deshalb
+    // das Eingabeinstrument, sonst spielt sie auf dem Sample der Zeile davor.
+    if (self.InInstr() != 0) { ins := self.InInstr(); }
+    self.Block.PutCell(self.CurLine, self.CurTrack,
+                       CellPack(note, ins, CellCmd(cell), CellLevel(cell)));
+    self.Preview(note);
+    self.AdvanceStep();
+  }
+
+  // Eine Hexziffer in das Cursorfeld schreiben. Welche Haelfte welches Bytes
+  // getroffen wird, haengt am Cursorfeld — deshalb steht die Zuordnung hier
+  // und nicht verstreut in der Tastenbehandlung.
+  fn PutHex(v: int64): void {
+    var cell: int64 := self.Block.Cell(self.CurLine, self.CurTrack);
+    var note: int64 := CellNote(cell);
+    var ins: int64 := CellInstr(cell);
+    var cmd: int64 := CellCmd(cell);
+    var lev: int64 := CellLevel(cell);
+    var col: int64 := self.CurCol;
+
+    if (col == 1) { ins := (v << 4) | (ins & 0x0F); }
+    if (col == 2) { ins := (ins & 0xF0) | v; }
+
+    if (self.ExtCmd) {
+      if (col == 3) { cmd := (v << 4) | (cmd & 0x0F); }
+      if (col == 4) { cmd := (cmd & 0xF0) | v; }
+      if (col == 5) { lev := (v << 4) | (lev & 0x0F); }
+      if (col == 6) { lev := (lev & 0xF0) | v; }
+    } else {
+      // Schmale Anzeige: das Command ist einstellig sichtbar, also trifft die
+      // Ziffer sein unteres Nibble. Das obere bleibt stehen — es waere sonst
+      // nicht mehr erreichbar und ginge beim Tippen verloren.
+      if (col == 3) { cmd := (cmd & 0xF0) | v; }
+      if (col == 4) { lev := (v << 4) | (lev & 0x0F); }
+      if (col == 5) { lev := (lev & 0xF0) | v; }
+    }
+
+    self.Block.PutCell(self.CurLine, self.CurTrack, CellPack(note, ins, cmd, lev));
+    self.AdvanceStep();
+  }
+
+  fn SetOctave(oct: int64): void {
+    if (self.Bar == null) { return; }
+    var o: int64 := oct;
+    if (o < 1) { o := 1; }
+    if (o > 6) { o := 6; }
+    self.Bar.Octave := o;
+    self.Bar.Invalidate();
+  }
+
+  fn SetStep(st: int64): void {
+    if (self.Bar == null) { return; }
+    var v: int64 := st;
+    if (v < 0) { v := 0; }
+    if (v > 16) { v := 16; }
+    self.Bar.Step := v;
+    self.Bar.Invalidate();
+  }
+
+  // Zeichen kommen getrennt von den Tasten herein (TControl.DoChar). Ausserhalb
+  // des Editiermodus wird nichts geschrieben: der Blockeditor ist im
+  // Grundzustand ein Betrachter, genau wie in OctaMED.
+  override fn DoChar(cp: int64): void {
+    if (!self.IsEnabled()) { return; }
+    if (self.Block == null) { return; }
+
+    // Oktave und Step gelten auch ohne Editiermodus — sie aendern den Block
+    // nicht, sondern nur, was die naechste Eingabe schreiben wuerde.
+    if (cp == 45) { self.SetOctave(self.InOctave() - 1); return; }   // '-'
+    if (cp == 43) { self.SetOctave(self.InOctave() + 1); return; }   // '+'
+
+    // Ohne Editiermodus wird nichts geschrieben, aber gespielt: so probiert
+    // man ein Instrument aus, ohne den Block zu veraendern — genau das tut
+    // OctaMED auch.
+    if (!self.EditMode) {
+      var s2: int64 := self.NoteKey(cp);
+      if (s2 >= 0) { self.Preview(self.NoteOf(s2)); }
+      return;
+    }
+
+    if (self.CurCol == 0) {
+      var sem: int64 := self.NoteKey(cp);
+      if (sem >= 0) { self.PutNote(sem); return; }
+      return;
+    }
+
+    var v: int64 := self.HexKey(cp);
+    if (v >= 0) { self.PutHex(v); return; }
+  }
+
+  override fn Paint(canvas: TCanvas): void {
+    var r: TRect := self.ClientRect();
+    FillLowered(canvas, r, OmGridBg());
+    if (self.Block == null) { return; }
+
+    var f: TFont := DefaultFont();
+    var buf: int64 := Scratch();
+    var lpb: int64 := 4;
+    if (self.Song != null) { lpb := self.Song.Lpb; }
+    if (lpb < 1) { lpb := 1; }
+
+    var gutter: int64 := self.GutterWidth();
+    var tw: int64 := self.TrackWidth();
+    var ntracks: int64 := self.VisibleTracks();
+    var nlines: int64 := self.VisibleLines();
+
+    // Trennstriche zwischen den Tracks — duenn und dunkel, damit sie das
+    // Raster gliedern, ohne mit den Noten um Aufmerksamkeit zu ringen.
+    var t: int64 := 0;
+    while (t <= ntracks) {
+      var lx: int64 := 1 + gutter + (t * tw) - (OM_CHAR_W / 2);
+      canvas.VLine(lx, 1, RectHeight(r) - 2, OmDark());
+      t := t + 1;
+    }
+
+    var row: int64 := 0;
+    while (row < nlines) {
+      var line: int64 := self.TopLine + row;
+      if (line >= self.Block.Lines) { row := nlines; }
+      else {
+        var y: int64 := 1 + (row * OM_ROW_H);
+        var isCur: bool := line == self.CurLine;
+        var isBeat: bool := (line % lpb) == 0;
+
+        // Zeilenband: die aktuelle Zeile blau, Taktzeilen abgesetzt.
+        if (isCur) {
+          canvas.FillRect(Rect(1, y, RectWidth(r) - 1, y + OM_ROW_H), OmBlue());
+        } else {
+          if (isBeat) {
+            canvas.FillRect(Rect(1, y, RectWidth(r) - 1, y + OM_ROW_H),
+                            OmGridBeat());
+          }
+        }
+
+        var ink: TColor := OmBlack();
+        if (isCur) { ink := OmWhite(); }
+
+        // Zeilennummer
+        LineNoToText(buf, line, self.HexLines);
+        var noInk: TColor := OmGridLineNo();
+        if (isCur) { noInk := OmWhite(); }
+        f.DrawText(canvas, 3, y, buf as pchar, noInk);
+
+        // Zellen
+        var col: int64 := 0;
+        while (col < ntracks) {
+          var track: int64 := self.LeftTrack + col;
+          var cell: int64 := self.Block.Cell(line, track);
+          var n: int64 := CellToText(buf, cell, self.ExtCmd);
+          var cx: int64 := 1 + gutter + (col * tw);
+          var cellInk: TColor := ink;
+
+          // Markierter Bereich: eine Flaeche hinter der Zelle. Sie liegt unter
+          // dem Cursorfeld, damit der Cursor auch in der Markierung sichtbar
+          // bleibt.
+          if (self.InSelection(line, track)) {
+            canvas.FillRect(Rect(cx - (OM_CHAR_W / 2), y, cx + tw - (OM_CHAR_W / 2),
+                                 y + OM_ROW_H), OmGridRange());
+            if (!isCur) { cellInk := OmBlack(); }
+          }
+
+          // Cursorfeld: Flaeche vor dem Zellentext, damit die Fuellung die
+          // Zeichen nicht verschluckt. Die Zeichen im Feld werden weiter
+          // unten noch einmal in der Cursorschrift nachgezogen.
+          var onCur: bool := false;
+          var fx: int64 := 0;
+          var fw: int64 := 0;
+          if (isCur) {
+            if (track == self.CurTrack) {
+              onCur := true;
+              fx := cx + self.ColOffset(self.CurCol) * OM_CHAR_W;
+              fw := self.ColWidth(self.CurCol) * OM_CHAR_W;
+              var cur: TColor := OmGridCursorIdle();
+              if (self.EditMode) { cur := OmGridCursor(); }
+              canvas.FillRect(Rect(fx, y, fx + fw, y + OM_ROW_H), cur);
+            }
+          }
+
+          // Leere Zellen blasser: so sieht man die belegten Lines auf einen
+          // Blick, ohne dass die Striche verschwinden.
+          if (CellNote(cell) == 0) {
+            if (CellInstr(cell) == 0) {
+              if (CellCmd(cell) == 0) {
+                if (CellLevel(cell) == 0) {
+                  cellInk := OmDark();
+                  if (isCur) { cellInk := RGB(200, 210, 230); }
+                }
+              }
+            }
+          }
+          f.DrawText(canvas, cx, y, buf as pchar, cellInk);
+
+          // Zeichen im Cursorfeld nachziehen: der Zellentext wird in einem
+          // Stueck gezeichnet, also traegt er die Farbe der Zelle. Auf der
+          // Cursorflaeche braucht es die Gegenfarbe, sonst verschwindet die
+          // Note im Kasten.
+          if (onCur) {
+            var off: int64 := self.ColOffset(self.CurCol);
+            var w: int64 := self.ColWidth(self.CurCol);
+            var k: int64 := 0;
+            while (k < w) {
+              poke8(buf + 32 + k, peek8(buf + off + k));
+              k := k + 1;
+            }
+            poke8(buf + 32 + w, 0);
+            var curInk: TColor := OmWhite();
+            if (self.EditMode) { curInk := OmBlack(); }
+            f.DrawText(canvas, fx, y, (buf + 32) as pchar, curInk);
+          }
+
+          col := col + 1;
+        }
+        row := row + 1;
+      }
+    }
+  }
+}
+
+pub fn NewOmedGrid(): TOmedGrid {
+  return new TOmedGrid();
+}
+
+// ============================================================================
+// TOmedList — nummerierte Liste (Instrumente, Blocks, Sequence)
+// ============================================================================
+// Bewusst keine Vega-TListBox: die Zeilen sollen "01 Bass" heissen, mit
+// hexadezimaler, fester Nummernspalte. Eine Liste, die die Nummer nur als
+// Text im Eintrag fuehrt, verliert die Spaltenausrichtung beim ersten
+// zweistelligen Namen.
+pub type TOmedList = class extends TControl {
+  Title: pchar;
+  Items: TStringList;
+  Numbers: TIntArray;
+  ItemCount: int64;
+  Sel: int64;
+  TopItem: int64;
+  HexNumbers: bool;
+  OnSelect: TNotifyEvent;
+
+  fn Create(title: pchar): void {
+    self.Init();
+    self.StyleType := StyleRegistry().TypeId("listBox");
+    self.Title := title;
+    self.Items := new TStringList();
+    self.Numbers := new TIntArray(256);
+    self.ItemCount := 0;
+    self.Sel := 0;
+    self.TopItem := 0;
+    self.HexNumbers := true;
+    self.OnSelect := 0;
+    self.CanFocus := true;
+  }
+
+  fn Destroy(): void {
+    if (self.Items != null) { self.Items.Destroy(); }
+    if (self.Numbers != null) { self.Numbers.Destroy(); }
+  }
+
+  fn AddEntry(number: int64, text: pchar): void {
+    if (self.ItemCount >= 256) { return; }
+    self.Items.Add(text);
+    self.Numbers.Put(self.ItemCount, number);
+    self.ItemCount := self.ItemCount + 1;
+    self.Invalidate();
+  }
+
+  fn ClearEntries(): void {
+    self.Items.Destroy();
+    self.Items := new TStringList();
+    self.ItemCount := 0;
+    self.Sel := 0;
+    self.TopItem := 0;
+    self.Invalidate();
+  }
+
+  fn RowsVisible(): int64 {
+    var n: int64 := (self.Height - OM_ROW_H - 3) / OM_ROW_H;
+    if (n < 1) { return 1; }
+    return n;
+  }
+
+  override fn Paint(canvas: TCanvas): void {
+    var r: TRect := self.ClientRect();
+    FillRaised(canvas, r, OmGrey());
+
+    var f: TFont := DefaultFont();
+    var buf: int64 := Scratch();
+
+    // Titelzeile: invertiert, wie die Fensterleisten in OctaMED.
+    var head: TRect := Rect(1, 1, RectWidth(r) - 1, 1 + OM_ROW_H);
+    canvas.FillRect(head, OmBlack());
+    if (self.Title != 0) {
+      f.DrawText(canvas, 3, 1, self.Title, OmWhite());
+    }
+
+    var listArea: TRect := Rect(1, 1 + OM_ROW_H, RectWidth(r) - 1,
+                                RectHeight(r) - 1);
+    canvas.FillRect(listArea, OmGridBg());
+    BevelLowered(canvas, listArea);
+
+    var rows: int64 := self.RowsVisible();
+    var i: int64 := 0;
+    while (i < rows) {
+      var idx: int64 := self.TopItem + i;
+      if (idx >= self.ItemCount) { i := rows; }
+      else {
+        var y: int64 := listArea.Top + 1 + (i * OM_ROW_H);
+        var ink: TColor := OmBlack();
+        if (idx == self.Sel) {
+          canvas.FillRect(Rect(listArea.Left + 1, y, listArea.Right - 1,
+                               y + OM_ROW_H), OmBlue());
+          ink := OmWhite();
+        }
+        if (self.HexNumbers) { Hex2ToBuf(buf, self.Numbers.Get(idx)); }
+        else { var d: int64 := IntToBuf(buf, self.Numbers.Get(idx)); }
+        f.DrawText(canvas, listArea.Left + 3, y, buf as pchar, ink);
+        f.DrawText(canvas, listArea.Left + 3 + 3 * OM_CHAR_W, y,
+                   self.Items.Get(idx), ink);
+        i := i + 1;
+      }
+    }
+  }
+
+  override fn DoMouseDown(x: int64, y: int64, button: int64): void {
+    var row: int64 := (y - 2 - OM_ROW_H) / OM_ROW_H;
+    if (row < 0) { return; }
+    var idx: int64 := self.TopItem + row;
+    if (idx >= self.ItemCount) { return; }
+    self.Sel := idx;
+    self.Invalidate();
+    if (self.OnSelect != 0) { self.OnSelect(self as TControl); }
+  }
+}
+
+pub fn NewOmedList(title: pchar): TOmedList {
+  return new TOmedList(title);
+}

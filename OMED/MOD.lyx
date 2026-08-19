@@ -1,0 +1,349 @@
+// OMED/MOD.lyx — ProTracker-Module lesen.
+//
+// MOD ist nicht MMD. Es ist das aeltere, einfachere Format vom selben Rechner:
+// fester Kopf, 31 Sampleplaetze, Patterns mit 64 Lines, alles hintereinander
+// ohne Zeigertabellen. Was fehlt, ist alles, was OctaMED spaeter dazugab —
+// Blocks eigener Laenge, Sections, MIDI, mehr als 64 Lines.
+//
+// Aufbau:
+//   0x000  char  name[20]
+//   0x014  31 x MODSample zu 30 Byte
+//   0x3B6  u8    songlen        (Zahl der Sequenzeintraege, 1..128)
+//   0x3B7  u8    restart        (wird ignoriert)
+//   0x3B8  u8    sequence[128]  (Patternnummern)
+//   0x438  char  tag[4]         ("M.K.", "8CHN", ...)
+//   0x43C  Patterns, je 64 Lines x Kanaele x 4 Byte
+//          danach die Sampledaten in der Reihenfolge der Sampleplaetze
+//
+// MODSample (30 Byte): name[22], laenge in Worten (u16), finetune (u8),
+// volume (u8), repeat start in Worten (u16), repeat len in Worten (u16).
+//
+// Eine Notenzelle sind vier Bytes:
+//   b0: Instrument-Highbits (oberes Nibble), Perioden-Highbits (unteres)
+//   b1: Perioden-Lowbyte
+//   b2: Instrument-Lowbits (oberes Nibble), Effektnummer (unteres)
+//   b3: Effektparameter
+//
+// MOD speichert also PERIODEN, keine Notennummern — die Note ergibt sich aus
+// der Amiga-Periodentabelle. Das passt zu unserem Modell, weil die Engine
+// ohnehin in Perioden rechnet.
+
+@description("OctaMED-Tracker - ProTracker-Module lesen")
+@author("Andreas Roene")
+unit OMED.MOD;
+
+import std.fs;
+import OMED.Song;
+
+pub con MOD_MAX_FILE: int64 := 16 * 1024 * 1024;
+pub con MOD_HEADER_LEN: int64 := 1084;
+
+fn U16(p: int64): int64 {
+  return (peek8(p) << 8) | peek8(p + 1);
+}
+
+fn Tag4(p: int64, a: int64, b: int64, c: int64, d: int64): bool {
+  if (peek8(p) != a) { return false; }
+  if (peek8(p + 1) != b) { return false; }
+  if (peek8(p + 2) != c) { return false; }
+  if (peek8(p + 3) != d) { return false; }
+  return true;
+}
+
+fn CopyText(src: int64, maxLen: int64): pchar {
+  var len: int64 := 0;
+  var done: bool := false;
+  while (len < maxLen) {
+    if (done) { len := maxLen; }
+    else {
+      if (peek8(src + len) == 0) { done := true; }
+      else { len := len + 1; }
+    }
+  }
+  var dst: int64 := alloc(len + 1);
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(dst + i, peek8(src + i));
+    i := i + 1;
+  }
+  poke8(dst + len, 0);
+  return dst as pchar;
+}
+
+// Kanalzahl aus der Kennung. "M.K." und "M!K!" sind die vier Kanaele des
+// ProTrackers; "6CHN", "8CHN" und Verwandte kommen von den Trackern, die
+// spaeter mehr Kanaele in dasselbe Format gequetscht haben. Ohne bekannte
+// Kennung ist es ein Modul der ersten Stunde mit 15 Samples — das lehnen wir
+// ab, statt es zu erraten.
+pub fn ModChannels(p: int64): int64 {
+  if (Tag4(p, 77, 46, 75, 46)) { return 4; }        // M.K.
+  if (Tag4(p, 77, 33, 75, 33)) { return 4; }        // M!K!
+  if (Tag4(p, 70, 76, 84, 52)) { return 4; }        // FLT4
+  if (Tag4(p, 52, 67, 72, 78)) { return 4; }        // 4CHN
+  if (Tag4(p, 54, 67, 72, 78)) { return 6; }        // 6CHN
+  if (Tag4(p, 56, 67, 72, 78)) { return 8; }        // 8CHN
+  if (Tag4(p, 70, 76, 84, 56)) { return 8; }        // FLT8
+  if (Tag4(p, 67, 68, 56, 49)) { return 8; }        // CD81
+  if (Tag4(p, 79, 75, 84, 65)) { return 8; }        // OKTA
+  return 0;
+}
+
+// Periode -> Notennummer. Gesucht wird der naechstliegende Tabellenwert; die
+// Tabelle ist dieselbe wie in der Replay-Engine (C-1 = 856), nur hier ohne
+// Umweg ueber die Frequenz.
+fn BasePeriod(st: int64): int64 {
+  if (st == 0) { return 856; }
+  if (st == 1) { return 808; }
+  if (st == 2) { return 762; }
+  if (st == 3) { return 720; }
+  if (st == 4) { return 678; }
+  if (st == 5) { return 640; }
+  if (st == 6) { return 604; }
+  if (st == 7) { return 570; }
+  if (st == 8) { return 538; }
+  if (st == 9) { return 508; }
+  if (st == 10) { return 480; }
+  return 453;
+}
+
+pub fn PeriodToNote(period: int64): int64 {
+  if (period <= 0) { return 0; }
+
+  var best: int64 := 0;
+  var bestDiff: int64 := 1000000;
+  var oct: int64 := 1;
+  while (oct <= 6) {
+    var st: int64 := 0;
+    while (st < 12) {
+      var p: int64 := BasePeriod(st);
+      var k: int64 := 1;
+      while (k < oct) {
+        p := p / 2;
+        k := k + 1;
+      }
+      var diff: int64 := p - period;
+      if (diff < 0) { diff := -diff; }
+      if (diff < bestDiff) {
+        bestDiff := diff;
+        best := (oct - 1) * 12 + st + 1;
+      }
+      st := st + 1;
+    }
+    oct := oct + 1;
+  }
+  return best;
+}
+
+// ---- Effekte ---------------------------------------------------------------
+// ProTracker zaehlt seine Effekte anders als OctaMED. Die meisten haben eine
+// Entsprechung, ein paar nicht — und wo nichts passt, wird der Effekt
+// verworfen statt falsch uebersetzt. Ein falsch gedeuteter Effekt klingt
+// schlimmer als gar keiner.
+//
+// levelOut zeigt auf das Datenbyte, das mitgeaendert werden kann (E-Befehle
+// tragen ihre Unterfunktion im oberen Nibble).
+pub fn MapEffect(fx: int64, param: int64, levelOut: int64): int64 {
+  poke64(levelOut, param);
+
+  if (fx == 0x0) { return 0x00; }        // Arpeggio
+  if (fx == 0x1) { return 0x01; }        // Slide up
+  if (fx == 0x2) { return 0x02; }        // Slide down
+  if (fx == 0x3) { return 0x03; }        // Tone Portamento
+  if (fx == 0x4) { return 0x04; }        // Vibrato
+  if (fx == 0x5) { return 0x05; }        // Portamento + Volume Slide
+  if (fx == 0x6) { return 0x06; }        // Vibrato + Volume Slide
+  if (fx == 0x7) { return 0x07; }        // Tremolo
+  if (fx == 0x8) { return 0x00; }        // Panning: kennt OctaMED V5 nicht
+  if (fx == 0x9) { return 0x19; }        // Sample Offset
+  if (fx == 0xA) { return 0x0D; }        // Volume Slide
+  if (fx == 0xB) { return 0x0B; }        // Position Jump
+  if (fx == 0xC) { return 0x0C; }        // Set Volume
+  if (fx == 0xD) { return 0x1D; }        // Pattern Break -> naechster Eintrag
+  if (fx == 0xF) {
+    // Unter 0x20 ist es die Zahl der Ticks je Line (TPL), darueber das Tempo.
+    if (param < 0x20) { return 0x09; }
+    return 0x0F;
+  }
+
+  if (fx == 0xE) {
+    var sub: int64 := (param >> 4) & 0x0F;
+    var val: int64 := param & 0x0F;
+    poke64(levelOut, val);
+    if (sub == 0x1) { return 0x11; }     // Fine slide up
+    if (sub == 0x2) { return 0x12; }     // Fine slide down
+    if (sub == 0x5) { return 0x15; }     // Set Finetune
+    if (sub == 0x6) { return 0x16; }     // Pattern Loop
+    if (sub == 0x9) { poke64(levelOut, val); return 0x1F; }   // Retrigger
+    if (sub == 0xA) { return 0x1A; }     // Fine volume up
+    if (sub == 0xB) { return 0x1B; }     // Fine volume down
+    if (sub == 0xC) { return 0x18; }     // Note Cut
+    if (sub == 0xD) { poke64(levelOut, val << 4); return 0x1F; }  // Note Delay
+    if (sub == 0xE) { return 0x1E; }     // Pattern Delay -> Line wiederholen
+  }
+
+  poke64(levelOut, 0);
+  return 0x00;
+}
+
+// ---- Laden -----------------------------------------------------------------
+
+pub fn IsMOD(path: pchar): bool {
+  var buf: int64 := alloc(MOD_HEADER_LEN);
+  if (buf == 0) { return false; }
+  var n: int64 := ReadFile(path, buf as pchar, MOD_HEADER_LEN);
+  var ok: bool := false;
+  if (n >= MOD_HEADER_LEN) {
+    if (ModChannels(buf + 1080) > 0) { ok := true; }
+  }
+  free(buf, MOD_HEADER_LEN);
+  return ok;
+}
+
+pub fn LoadMOD(path: pchar): TSong {
+  var cap: int64 := MOD_MAX_FILE;
+  var data: int64 := alloc(cap);
+  if (data == 0) { return null; }
+  var size: int64 := ReadFile(path, data as pchar, cap);
+  if (size < MOD_HEADER_LEN) {
+    free(data, cap);
+    return null;
+  }
+
+  var channels: int64 := ModChannels(data + 1080);
+  if (channels < 1) {
+    free(data, cap);
+    return null;
+  }
+
+  var song: TSong := NewSong(CopyText(data, 20));
+  song.Tempo := 125;
+  song.Tpl := 6;
+  song.Lpb := 4;
+
+  // ---- Sampleplaetze ------------------------------------------------------
+  // Die Kopfdaten stehen vorn, die Daten hinter den Patterns. Erst wird also
+  // gelesen, wie lang jedes Sample ist, danach wird der Reihe nach kopiert.
+  var lengths: TIntArray := new TIntArray(32);
+  var i: int64 := 0;
+  while (i < 31) {
+    var o: int64 := data + 20 + (i * 30);
+    var ins: TInstrument := NewInstrument(CopyText(o, 22));
+    var lenWords: int64 := U16(o + 22);
+    var finetune: int64 := peek8(o + 24) & 0x0F;
+    var volume: int64 := peek8(o + 25);
+    var repStart: int64 := U16(o + 26);
+    var repLen: int64 := U16(o + 28);
+
+    // Finetune ist ein Viererbit mit Vorzeichen: 8..15 sind -8..-1.
+    if (finetune > 7) { finetune := finetune - 16; }
+    ins.FineTune := finetune;
+    if (volume > 64) { volume := 64; }
+    ins.Volume := volume;
+    ins.RepeatStart := repStart;
+    // Eine Schleifenlaenge von einem Wort heisst "keine Schleife" — so hat es
+    // ProTracker gehandhabt, und viele Module verlassen sich darauf.
+    if (repLen > 1) { ins.RepeatLen := repLen; }
+    else { ins.RepeatLen := 0; }
+
+    lengths.Put(i, lenWords * 2);
+    song.AddInstrument(ins);
+    i := i + 1;
+  }
+
+  var songLen: int64 := peek8(data + 950);
+  if (songLen > 128) { songLen := 128; }
+
+  // Wie viele Patterns gibt es? Das steht nirgends — es ist die hoechste
+  // Nummer, die in der Sequence vorkommt. Auch Eintraege hinter songlen
+  // zaehlen mit: manche Module lagern dort Patterns, die sonst verlorengehen.
+  var maxPat: int64 := 0;
+  i := 0;
+  while (i < 128) {
+    var no: int64 := peek8(data + 952 + i);
+    if (no > maxPat) { maxPat := no; }
+    i := i + 1;
+  }
+  var patCount: int64 := maxPat + 1;
+
+  var patSize: int64 := 64 * channels * 4;
+  var patBase: int64 := data + MOD_HEADER_LEN;
+  if (MOD_HEADER_LEN + (patCount * patSize) > size) {
+    free(data, cap);
+    return null;
+  }
+
+  // ---- Patterns -----------------------------------------------------------
+  var levelBox: int64 := alloc(8);
+  var pat: int64 := 0;
+  while (pat < patCount) {
+    var b: TBlock := NewBlock(channels, 64);
+    var line: int64 := 0;
+    while (line < 64) {
+      var ch: int64 := 0;
+      while (ch < channels) {
+        var c: int64 := patBase + (pat * patSize) + ((line * channels + ch) * 4);
+        var b0: int64 := peek8(c);
+        var b1: int64 := peek8(c + 1);
+        var b2: int64 := peek8(c + 2);
+        var b3: int64 := peek8(c + 3);
+
+        var period: int64 := ((b0 & 0x0F) << 8) | b1;
+        var instr: int64 := (b0 & 0xF0) | ((b2 >> 4) & 0x0F);
+        var fx: int64 := b2 & 0x0F;
+        var cmd: int64 := MapEffect(fx, b3, levelBox);
+        var level: int64 := peek64(levelBox);
+
+        b.PutCell(line, ch, CellPack(PeriodToNote(period), instr, cmd, level));
+        ch := ch + 1;
+      }
+      line := line + 1;
+    }
+    song.AddBlock(b);
+    pat := pat + 1;
+  }
+  free(levelBox, 8);
+
+  // ---- Sampledaten --------------------------------------------------------
+  var off: int64 := MOD_HEADER_LEN + (patCount * patSize);
+  i := 0;
+  while (i < 31) {
+    var len: int64 := lengths.Get(i);
+    if (len > 0) {
+      if (off + len <= size) {
+        var ins2: TInstrument := song.Instrument(i + 1);
+        if (ins2 != null) {
+          var dst: int64 := alloc(len);
+          if (dst != 0) {
+            var k: int64 := 0;
+            while (k < len) {
+              poke8(dst + k, peek8(data + off + k));
+              k := k + 1;
+            }
+            ins2.SampleData := dst;
+            ins2.SampleLen := len;
+            ins2.SampleRate := 8363;
+          }
+        }
+      }
+      off := off + len;
+    }
+    i := i + 1;
+  }
+
+  // ---- Playing Sequence ---------------------------------------------------
+  var seq: TPlaySeq := song.Seq();
+  i := 0;
+  while (i < songLen) {
+    seq.Add(peek8(data + 952 + i));
+    i := i + 1;
+  }
+  if (seq.Len == 0) { seq.Add(0); }
+
+  // Mehr als vier Kanaele heisst: das Stueck war nie fuer die Paula allein
+  // gedacht. Der Songflag entscheidet spaeter, welches Backend gewaehlt wird.
+  if (channels > 4) { song.EightChannel := true; }
+
+  lengths.Destroy();
+  free(data, cap);
+  return song;
+}

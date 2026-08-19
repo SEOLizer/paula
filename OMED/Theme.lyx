@@ -1,0 +1,102 @@
+// OMED/Theme.lyx — Amiga-Anmutung an einem Ort.
+//
+// Zwei Ebenen, absichtlich getrennt:
+//
+//   1. Das Vega-Stylesheet "octamed" (octamed.theme). Es faerbt alles, was
+//      Vega selbst zeichnet — Menueleiste, Knoepfe, Listen, Rahmen.
+//   2. Die Konstanten und Kantenhelfer hier. Sie gelten fuer die Flaechen,
+//      die der Tracker SELBST malt (Blockeditor, Infozeile), wo ein
+//      Stylesheet-Eintrag nichts nuetzt, weil es kein Vega-Widget ist.
+//
+// Die 1-Pixel-Kanten sind kein Detail: eine plastische Flaeche entsteht auf
+// dem Amiga aus genau zwei Linien — hell oben/links, dunkel unten/rechts.
+// Ein Farbverlauf oder ein Schatten waere hier falsch, nicht nur haesslich.
+
+@description("OctaMED-Tracker - Amiga-Theme")
+@author("Andreas Roene")
+unit OMED.Theme;
+
+import Vega.Types;
+import Vega.Canvas;
+import Vega.Themes;
+import Vega.ThemeFile;
+
+// ---- Palette (Workbench 3.x) -----------------------------------------------
+pub fn OmGrey(): TColor { return RGB(170, 170, 170); }   // Flaeche
+pub fn OmGreyDark(): TColor { return RGB(153, 153, 153); }  // abgesetzte Flaeche
+pub fn OmLight(): TColor { return RGB(255, 255, 255); }  // Lichtkante
+pub fn OmDark(): TColor { return RGB(85, 85, 85); }      // Schattenkante
+pub fn OmBlack(): TColor { return RGB(0, 0, 0); }        // Text, harte Rahmen
+pub fn OmBlue(): TColor { return RGB(102, 136, 187); }   // Auswahl
+pub fn OmWhite(): TColor { return RGB(255, 255, 255); }  // Text auf Auswahl
+
+// Zellhintergrund im Blockeditor. Nicht weiss: OctaMED zeigte das Raster auf
+// einer abgesetzten, nicht auf einer leuchtenden Flaeche.
+pub fn OmGridBg(): TColor { return RGB(136, 136, 136); }
+// Jede LPB-te Zeile — der Taktschlag muss ohne Hinsehen erkennbar sein.
+pub fn OmGridBeat(): TColor { return RGB(153, 153, 170); }
+pub fn OmGridLineNo(): TColor { return RGB(51, 51, 68); }
+
+// Cursorfeld im Blockeditor. Zwei Farben, weil der Editiermodus ohne
+// Blick auf eine Statuszeile erkennbar sein muss: orange heisst "Tippen
+// schreibt in den Block", blau heisst "Cursor bewegt sich nur".
+pub fn OmGridCursor(): TColor { return RGB(238, 170, 34); }
+pub fn OmGridCursorIdle(): TColor { return RGB(17, 34, 68); }
+// Markierter Bereich. Heller als die Taktzeile, dunkler als die Auswahlfarbe
+// der Listen: die Markierung soll den Blick fuehren, aber die Noten nicht
+// uebertoenen.
+pub fn OmGridRange(): TColor { return RGB(136, 153, 187); }
+
+// ---- Kanten ----------------------------------------------------------------
+// Erhabene Flaeche: hell oben/links, dunkel unten/rechts.
+pub fn BevelRaised(canvas: TCanvas, r: TRect): void {
+  canvas.HLine(r.Left, r.Right - 1, r.Top, OmLight());
+  canvas.VLine(r.Left, r.Top, r.Bottom - 1, OmLight());
+  canvas.HLine(r.Left, r.Right - 1, r.Bottom - 1, OmDark());
+  canvas.VLine(r.Right - 1, r.Top, r.Bottom - 1, OmDark());
+}
+
+// Vertiefte Flaeche: dieselben Linien, nur getauscht.
+pub fn BevelLowered(canvas: TCanvas, r: TRect): void {
+  canvas.HLine(r.Left, r.Right - 1, r.Top, OmDark());
+  canvas.VLine(r.Left, r.Top, r.Bottom - 1, OmDark());
+  canvas.HLine(r.Left, r.Right - 1, r.Bottom - 1, OmLight());
+  canvas.VLine(r.Right - 1, r.Top, r.Bottom - 1, OmLight());
+}
+
+// Erhabene Flaeche samt Fuellung — der haeufigste Fall.
+pub fn FillRaised(canvas: TCanvas, r: TRect, fill: TColor): void {
+  canvas.FillRect(r, fill);
+  BevelRaised(canvas, r);
+}
+
+pub fn FillLowered(canvas: TCanvas, r: TRect, fill: TColor): void {
+  canvas.FillRect(r, fill);
+  BevelLowered(canvas, r);
+}
+
+// ---- Stylesheet anmelden ---------------------------------------------------
+// Waechter als int64 und nicht als Null-Test auf eine Klassenvariable:
+// globale Variablen mit Klassentyp sind in lyxc NICHT mit 0 vorbelegt
+// (Befund F in lyx-gpi/ISSUE-lyxc-und-vega.md).
+var _theme_loaded: int64;
+var _theme_ok: int64;
+
+// Laedt octamed.theme und schaltet darauf um. Faellt die Datei aus, bleibt es
+// beim eingebauten hellen Theme — ein fehlendes Theme darf den Tracker nicht
+// am Starten hindern, es sieht dann nur falsch aus.
+//
+// Rueckgabe: true, wenn "octamed" tatsaechlich aktiv ist.
+pub fn UsePaulaTheme(path: pchar): bool {
+  if (_theme_loaded == 0) {
+    _theme_loaded := 1;
+    var res: TThemeLoadResult := RegisterThemeFile(path, false);
+    if (res != null) {
+      if (res.Ok) {
+        if (res.Sheet != null) { _theme_ok := 1; }
+      }
+    }
+  }
+  if (_theme_ok == 0) { return false; }
+  return UseTheme("paula");
+}

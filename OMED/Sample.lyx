@@ -1,0 +1,283 @@
+// OMED/Sample.lyx — Sampledaten in ein Instrument laden.
+//
+// Zwei Formate, beide von der Amiga her: IFF-8SVX (das Format, in dem
+// OctaMED-Instrumente vorliegen) und rohe Bytes ohne Kopf. Mehr braucht Phase 4
+// nicht — 16-Bit-, Synth- und Hybrid-Instrumente sind spaetere Ausbaustufen.
+//
+// Sampledaten sind IMMER signed 8 Bit. Das ist keine Sparsamkeit, sondern das
+// Format der Paula-Hardware: der Chip liest vorzeichenbehaftete Bytes und
+// spielt sie ohne weitere Umrechnung ab.
+
+@description("OctaMED-Tracker - Samples laden (IFF-8SVX, RAW)")
+@author("Andreas Roene")
+unit OMED.Sample;
+
+import std.fs;
+import OMED.Song;
+
+// Ueblicher Amiga-Standardwert: C-3 eines ungetunten Samples. 8SVX-Dateien
+// bringen ihre eigene Rate mit, RAW-Dateien nicht.
+pub con OM_DEFAULT_RATE: int64 := 8363;
+
+// Groesse einer Datei ermitteln, indem sie gelesen wird — der Umweg ueber
+// stat lohnt nicht, die Datei wird ohnehin gleich komplett gebraucht.
+fn ReadWholeFile(path: pchar, lenOut: int64): int64 {
+  poke64(lenOut, 0);
+  var cap: int64 := 4 * 1024 * 1024;      // 4 MiB: mehr als jedes Amiga-Sample
+  var buf: int64 := alloc(cap);
+  if (buf == 0) { return 0; }
+  var n: int64 := ReadFile(path, buf as pchar, cap);
+  if (n <= 0) {
+    free(buf, cap);
+    return 0;
+  }
+  poke64(lenOut, n);
+  return buf;
+}
+
+// IFF ist big endian — auf x86 muss jedes Feld von Hand zusammengesetzt
+// werden. Ein Cast auf int32 laese die Bytes verdreht.
+fn BE16(p: int64): int64 {
+  return (peek8(p) << 8) | peek8(p + 1);
+}
+
+fn BE32(p: int64): int64 {
+  return (peek8(p) << 24) | (peek8(p + 1) << 16) | (peek8(p + 2) << 8) | peek8(p + 3);
+}
+
+fn Tag(p: int64, a: int64, b: int64, c: int64, d: int64): bool {
+  if (peek8(p) != a) { return false; }
+  if (peek8(p + 1) != b) { return false; }
+  if (peek8(p + 2) != c) { return false; }
+  if (peek8(p + 3) != d) { return false; }
+  return true;
+}
+
+// Sampledaten an ein Instrument haengen. Ein vorher geladenes Sample wird
+// freigegeben — sonst waechst der Speicher mit jedem Ladevorgang.
+fn AttachSample(ins: TInstrument, data: int64, len: int64, rate: int64): void {
+  if (ins.SampleData != 0) {
+    free(ins.SampleData, ins.SampleLen);
+  }
+  ins.SampleData := data;
+  ins.SampleLen := len;
+  ins.SampleRate := rate;
+}
+
+// ---- RAW -------------------------------------------------------------------
+// Kopflose Datei: jedes Byte ein Sample. Ohne Kopf gibt es keine Rate, also
+// gilt der Amiga-Standardwert.
+pub fn LoadRawSample(ins: TInstrument, path: pchar): bool {
+  if (ins == null) { return false; }
+  var lenBox: int64 := alloc(8);
+  var buf: int64 := ReadWholeFile(path, lenBox);
+  if (buf == 0) { free(lenBox, 8); return false; }
+  var len: int64 := peek64(lenBox);
+  free(lenBox, 8);
+
+  var data: int64 := alloc(len);
+  if (data == 0) { free(buf, 4 * 1024 * 1024); return false; }
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(data + i, peek8(buf + i));
+    i := i + 1;
+  }
+  free(buf, 4 * 1024 * 1024);
+
+  AttachSample(ins, data, len, OM_DEFAULT_RATE);
+  ins.RepeatStart := 0;
+  ins.RepeatLen := 0;
+  return true;
+}
+
+// ---- IFF-8SVX --------------------------------------------------------------
+// Aufbau: "FORM" <len> "8SVX", danach Chunks aus vier Kennbuchstaben, Laenge
+// und Daten. Gebraucht werden VHDR (Laengen und Rate) und BODY (die Samples);
+// NAME, ANNO, CHAN und der Rest werden uebersprungen.
+//
+// VHDR:
+//   0  oneShotHiSamples   u32   Laenge des nicht wiederholten Teils
+//   4  repeatHiSamples    u32   Laenge der Schleife, 0 = keine
+//   8  samplesPerHiCycle  u32
+//  12  samplesPerSec      u16
+//  14  ctOctave           u8    Zahl der Oktavenkopien im BODY
+//  15  sCompression       u8    0 = keine; alles andere wird abgelehnt
+//  16  volume             u32   Fixpunkt 16.16, 0x10000 = voll
+pub fn Load8SVXSample(ins: TInstrument, path: pchar): bool {
+  if (ins == null) { return false; }
+  var lenBox: int64 := alloc(8);
+  var buf: int64 := ReadWholeFile(path, lenBox);
+  if (buf == 0) { free(lenBox, 8); return false; }
+  var size: int64 := peek64(lenBox);
+  free(lenBox, 8);
+  var cap: int64 := 4 * 1024 * 1024;
+
+  if (size < 12) { free(buf, cap); return false; }
+  if (!Tag(buf, 70, 79, 82, 77)) { free(buf, cap); return false; }        // FORM
+  if (!Tag(buf + 8, 56, 83, 86, 88)) { free(buf, cap); return false; }    // 8SVX
+
+  var oneShot: int64 := 0;
+  var repeatLen: int64 := 0;
+  var rate: int64 := OM_DEFAULT_RATE;
+  var vol: int64 := 64;
+  var body: int64 := 0;
+  var bodyLen: int64 := 0;
+
+  var p: int64 := 12;
+  while (p + 8 <= size) {
+    var clen: int64 := BE32(buf + p + 4);
+    var cdata: int64 := buf + p + 8;
+    if (clen < 0) { p := size; }
+    else {
+      if (Tag(buf + p, 86, 72, 68, 82)) {                                 // VHDR
+        if (clen >= 20) {
+          oneShot := BE32(cdata);
+          repeatLen := BE32(cdata + 4);
+          rate := BE16(cdata + 12);
+          if (rate <= 0) { rate := OM_DEFAULT_RATE; }
+          if (peek8(cdata + 15) != 0) {
+            // Fibonacci-Delta-Kompression: ein anderes Format, kein Randfall.
+            free(buf, cap);
+            return false;
+          }
+          var v: int64 := BE32(cdata + 16);
+          // 16.16-Fixpunkt auf den OctaMED-Bereich 0..64 bringen.
+          vol := (v * 64) / 65536;
+          if (vol < 0) { vol := 0; }
+          if (vol > 64) { vol := 64; }
+        }
+      }
+      if (Tag(buf + p, 66, 79, 68, 89)) {                                 // BODY
+        body := cdata;
+        bodyLen := clen;
+      }
+      // Chunks sind auf gerade Laengen ausgerichtet; das Fuellbyte zaehlt
+      // nicht zur Chunklaenge, steht aber in der Datei.
+      var step: int64 := clen;
+      if ((step % 2) != 0) { step := step + 1; }
+      p := p + 8 + step;
+    }
+  }
+
+  if (body == 0) { free(buf, cap); return false; }
+  if (bodyLen > size - (body - buf)) { bodyLen := size - (body - buf); }
+
+  // Mehrere Oktavenkopien im BODY interessieren hier nicht: gebraucht wird
+  // die erste, also oneShot + repeat. Fehlen die Angaben, gilt der ganze BODY.
+  var len: int64 := oneShot + repeatLen;
+  if (len <= 0) { len := bodyLen; }
+  if (len > bodyLen) { len := bodyLen; }
+
+  var data: int64 := alloc(len);
+  if (data == 0) { free(buf, cap); return false; }
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(data + i, peek8(body + i));
+    i := i + 1;
+  }
+  free(buf, cap);
+
+  AttachSample(ins, data, len, rate);
+  // rep/replen zaehlen in Worten, so wie es die MMD-Struktur und die
+  // Paula-Register tun.
+  ins.RepeatStart := oneShot / 2;
+  ins.RepeatLen := repeatLen / 2;
+  ins.Volume := vol;
+  return true;
+}
+
+// Format am Inhalt erkennen, nicht an der Endung: eine 8SVX-Datei heisst auf
+// dem Amiga oft einfach "Bass".
+pub fn LoadSampleFile(ins: TInstrument, path: pchar): bool {
+  var lenBox: int64 := alloc(8);
+  var buf: int64 := ReadWholeFile(path, lenBox);
+  if (buf == 0) { free(lenBox, 8); return false; }
+  var size: int64 := peek64(lenBox);
+  free(lenBox, 8);
+  var isIff: bool := false;
+  if (size >= 12) {
+    if (Tag(buf, 70, 79, 82, 77)) {
+      if (Tag(buf + 8, 56, 83, 86, 88)) { isIff := true; }
+    }
+  }
+  free(buf, 4 * 1024 * 1024);
+
+  if (isIff) { return Load8SVXSample(ins, path); }
+  return LoadRawSample(ins, path);
+}
+
+// ---- Ersatzklang -----------------------------------------------------------
+// Ein Sample, das ohne Datei entsteht: eine Rechteckschwingung mit linearem
+// Abfall. Damit ist der Editor auch dann hoerbar, wenn noch kein Instrument
+// geladen wurde — und in einem Tracker ist Stille beim Tippen der schlechteste
+// aller Zustaende.
+// Ein Ton, der stehen bleibt: Anschlag, Abfall auf einen Haltepegel, danach
+// eine Schleife ueber zwei Schwingungen. Genau so sind Amiga-Instrumente
+// gebaut — der Anfang gibt den Charakter, die Schleife haelt den Ton, solange
+// die Note steht. Ohne Schleife bricht jede Note nach der Samplelaenge ab,
+// und bei 1920 Bytes ist das eine Zehntelsekunde.
+//
+// rep/replen zaehlen in Worten, weil die Paula-Register das tun.
+pub fn MakeHeldSample(ins: TInstrument, cycleLen: int64, cycles: int64): bool {
+  if (ins == null) { return false; }
+  var cyc: int64 := cycleLen;
+  if (cyc < 4) { cyc := 4; }
+  var n: int64 := cycles;
+  if (n < 4) { n := 4; }
+  var len: int64 := cyc * n;
+
+  // Die Schleife liegt auf den letzten zwei Schwingungen. Sie muss auf einer
+  // Schwingungsgrenze beginnen, sonst knackt es bei jedem Durchlauf.
+  var loopLen: int64 := cyc * 2;
+  var loopStart: int64 := len - loopLen;
+
+  var data: int64 := alloc(len);
+  if (data == 0) { return false; }
+  var i: int64 := 0;
+  while (i < len) {
+    var amp: int64 := 0;
+    if (i < loopStart) {
+      // Anschlag und Abfall: von voll auf den Haltepegel 45.
+      if (loopStart > 0) { amp := 110 - ((65 * i) / loopStart); }
+      else { amp := 110; }
+    } else {
+      amp := 45;
+    }
+    var v: int64 := amp;
+    if ((i % cyc) >= (cyc / 2)) { v := -amp; }
+    if (v < 0) { v := v + 256; }
+    poke8(data + i, v & 0xFF);
+    i := i + 1;
+  }
+
+  AttachSample(ins, data, len, OM_DEFAULT_RATE);
+  ins.RepeatStart := loopStart / 2;
+  ins.RepeatLen := loopLen / 2;
+  return true;
+}
+
+pub fn MakeSquareSample(ins: TInstrument, cycleLen: int64, cycles: int64): bool {
+  if (ins == null) { return false; }
+  var cyc: int64 := cycleLen;
+  if (cyc < 4) { cyc := 4; }
+  var n: int64 := cycles;
+  if (n < 1) { n := 1; }
+  var len: int64 := cyc * n;
+
+  var data: int64 := alloc(len);
+  if (data == 0) { return false; }
+  var i: int64 := 0;
+  while (i < len) {
+    var amp: int64 := 100 - ((100 * i) / len);       // linearer Abfall
+    var v: int64 := amp;
+    if ((i % cyc) >= (cyc / 2)) { v := -amp; }
+    if (v < 0) { v := v + 256; }                     // signed 8 Bit als Byte
+    poke8(data + i, v & 0xFF);
+    i := i + 1;
+  }
+
+  AttachSample(ins, data, len, OM_DEFAULT_RATE);
+  ins.RepeatStart := 0;
+  ins.RepeatLen := 0;
+  return true;
+}

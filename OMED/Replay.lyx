@@ -1,0 +1,1002 @@
+// OMED/Replay.lyx — was gespielt wird.
+//
+// Die Engine kennt Ticks, Lines, Blocks und die Playing Sequence, aber KEIN
+// Backend-Detail: sie sagt "Kanal 2, Periode 214, Volume 48" und ueberlaesst
+// es dem Backend, ob daraus ein Paula-Kanal, eine von acht gemischten Stimmen
+// oder ein moderner Mixerzug wird. Genau an dieser Linie entscheidet sich, ob
+// das historische Verhalten ein Implementierungsdetail bleibt.
+//
+// Zeitmodell wie im Original:
+//
+//   Tick  — kleinste Einheit. Auf dem Amiga der Vertical Blank, hier aus dem
+//           Tempo gerechnet. Effekte laufen je Tick.
+//   Line  — TPL Ticks lang (tempo2). Auf Tick 0 werden die Noten angeschlagen.
+//   Block — Lines des aktuellen Blocks.
+//   Song  — die Playing Sequence ueber die Blocks.
+//
+// Die Command-Nummern sind die von OctaMED V5 (Abschnitt 7 der Design-Spec),
+// NICHT die von ProTracker. Wo ein Command dort eine Entsprechung hat, steht
+// sie im Kommentar.
+
+@description("OctaMED-Tracker - Replay-Engine und Command-Dispatch")
+@author("Andreas Roene")
+unit OMED.Replay;
+
+import Vega.Lists;
+import OMED.Song;
+import OMED.Playback;
+import OMED.Midi;
+
+pub con OM_MAX_REPLAY_TRACKS: int64 := 16;
+
+// Sinustabelle fuer Vibrato und Tremolo, ein Viertel je Vorzeichenwechsel.
+// Dieselben 32 Werte wie in der Amiga-Replayroutine — eine berechnete Sinus-
+// funktion klaenge weicher und damit falsch.
+fn SineTable(i: int64): int64 {
+  var k: int64 := i % 32;
+  if (k == 0) { return 0; }
+  if (k == 1) { return 24; }
+  if (k == 2) { return 49; }
+  if (k == 3) { return 74; }
+  if (k == 4) { return 97; }
+  if (k == 5) { return 120; }
+  if (k == 6) { return 141; }
+  if (k == 7) { return 161; }
+  if (k == 8) { return 180; }
+  if (k == 9) { return 197; }
+  if (k == 10) { return 212; }
+  if (k == 11) { return 224; }
+  if (k == 12) { return 235; }
+  if (k == 13) { return 244; }
+  if (k == 14) { return 250; }
+  if (k == 15) { return 253; }
+  if (k == 16) { return 255; }
+  if (k == 17) { return 253; }
+  if (k == 18) { return 250; }
+  if (k == 19) { return 244; }
+  if (k == 20) { return 235; }
+  if (k == 21) { return 224; }
+  if (k == 22) { return 212; }
+  if (k == 23) { return 197; }
+  if (k == 24) { return 180; }
+  if (k == 25) { return 161; }
+  if (k == 26) { return 141; }
+  if (k == 27) { return 120; }
+  if (k == 28) { return 97; }
+  if (k == 29) { return 74; }
+  if (k == 30) { return 49; }
+  return 24;
+}
+
+// Periode um n Halbtoene nach oben verschieben. Perioden sind reziprok zur
+// Frequenz, ein Halbton ist also kein fester Abstand, sondern der Faktor
+// 1/2^(1/12) — hier als Bruch, weil es keine Gleitkommazahlen braucht.
+pub fn PeriodShiftSemitones(period: int64, semitones: int64): int64 {
+  var p: int64 := period;
+  var n: int64 := semitones;
+  while (n > 0) {
+    // 1/2^(1/12) ist rund 0,943874; 15295/16210 trifft das auf fuenf Stellen.
+    p := (p * 15295) / 16210;
+    n := n - 1;
+  }
+  while (n < 0) {
+    p := (p * 16210) / 15295;
+    n := n + 1;
+  }
+  return p;
+}
+
+// ---- Zustand eines Tracks --------------------------------------------------
+// Ein Tracker-Command wirkt fast nie nur auf seine Line: ein Slide laeuft ueber
+// alle Ticks, ein Portamento ueber mehrere Lines, ein Vibrato behaelt seine
+// Phase. Deshalb hat jeder Track sein Gedaechtnis.
+pub type TTrackState = class {
+  Instr: int64;         // zuletzt gesetztes Instrument
+  Period: int64;        // aktuell klingende Periode
+  BasePeriod: int64;    // Periode der angeschlagenen Note, ohne Effekt
+  TargetPeriod: int64;  // Ziel des Portamentos (Command 03)
+  Volume: int64;        // 0..64
+  BaseVolume: int64;    // Volume ohne Tremolo
+
+  Cmd: int64;
+  Level: int64;
+
+  VibPos: int64;
+  VibSpeed: int64;
+  VibDepth: int64;
+  TremPos: int64;
+  TremSpeed: int64;
+  TremDepth: int64;
+
+  PortaSpeed: int64;
+  ArpNote: int64;       // Grundnote fuer Arpeggio (Command 00)
+
+  // MIDI. Ein Track ist nicht von sich aus MIDI-Track: er wird es, sobald ein
+  // Instrument mit gesetztem midich darauf gespielt wird — genau so entscheidet
+  // OctaMED, und deshalb steht der Kanal hier und nicht in einer Trackliste.
+  MidiChan: int64;      // 1..16, 0 = kein MIDI
+  MidiNote: int64;      // klingende MIDI-Note, 0 = keine
+  MidiPreset: int64;    // zuletzt gesendetes Programm, -1 = noch keins
+  MidiBend: int64;      // aktueller Pitchbend, 8192 = Mitte
+  MidiCc: int64;        // Controllernummer fuer Command 05/00
+  HoldTicks: int64;     // Command 08: Note nach n Ticks beenden, -1 = aus
+
+  // Hold und Decay des INSTRUMENTS (nicht des Commands): nach Hold Ticks
+  // beginnt die Note auszuklingen, je Tick um Decay leiser. Ohne das haelt
+  // eine Note mit Sampleschleife, bis die naechste kommt — musikalisch ist
+  // das selten gemeint.
+  SampleHold: int64;    // verbleibende Ticks, bis das Ausklingen beginnt
+  Decaying: bool;
+  DecayRate: int64;
+
+  CutTick: int64;       // Command 18: ab diesem Tick stumm, -1 = aus
+  DelayTick: int64;     // Command 1F: erst hier anschlagen, -1 = aus
+  DelayNote: int64;     // die Note, die verzoegert angeschlagen wird
+  RetrigTicks: int64;   // Command 1F: alle n Ticks neu anschlagen, 0 = aus
+
+  fn Create(): void {
+    self.Instr := 0;
+    self.Period := 0;
+    self.BasePeriod := 0;
+    self.TargetPeriod := 0;
+    self.Volume := 64;
+    self.BaseVolume := 64;
+    self.Cmd := 0;
+    self.Level := 0;
+    self.VibPos := 0;
+    self.VibSpeed := 0;
+    self.VibDepth := 0;
+    self.TremPos := 0;
+    self.TremSpeed := 0;
+    self.TremDepth := 0;
+    self.PortaSpeed := 0;
+    self.ArpNote := 0;
+    self.MidiChan := 0;
+    self.MidiNote := 0;
+    self.MidiPreset := -1;
+    self.MidiBend := 8192;
+    self.MidiCc := 0;
+    self.HoldTicks := -1;
+    self.SampleHold := 0;
+    self.Decaying := false;
+    self.DecayRate := 0;
+    self.CutTick := -1;
+    self.DelayTick := -1;
+    self.DelayNote := 0;
+    self.RetrigTicks := 0;
+  }
+}
+
+// ---- Engine ----------------------------------------------------------------
+pub type TReplayEngine = class {
+  Song: TSong;
+  Backend: TPlaybackBackend;
+  Midi: TMidiOut;         // 0 bzw. nicht geoeffnet = keine MIDI-Ausgabe
+  Tracks: TIntArray;      // Zeiger auf TTrackState
+
+  Playing: bool;
+  SongMode: bool;         // true = Playing Sequence, false = ein Block
+  BlockNo: int64;
+  Line: int64;
+  Tick: int64;
+  SeqPos: int64;
+
+  Tpl: int64;             // Ticks je Line (tempo2)
+  Tempo: int64;           // deftempo, als BPM gelesen
+
+  // Command 16 (Repeat Lines): Startline und verbleibende Durchlaeufe.
+  LoopLine: int64;
+  LoopCount: int64;
+
+  // Command 1E (Replay Line) und 0F FF2/FF4/FF5 (Line Delay) brauchen einen
+  // Merker, der EINE Line ueberlebt.
+  ReplayLine: bool;
+  DelayLines: int64;
+
+  fn Create(): void {
+    self.Song := null;
+    self.Backend := null;
+    self.Midi := null;
+    self.Tracks := new TIntArray(OM_MAX_REPLAY_TRACKS);
+    var i: int64 := 0;
+    while (i < OM_MAX_REPLAY_TRACKS) {
+      self.Tracks.Put(i, (new TTrackState()) as int64);
+      i := i + 1;
+    }
+    self.Playing := false;
+    self.SongMode := false;
+    self.BlockNo := 0;
+    self.Line := 0;
+    self.Tick := 0;
+    self.SeqPos := 0;
+    self.Tpl := 6;
+    self.Tempo := 125;
+    self.LoopLine := 0;
+    self.LoopCount := 0;
+    self.ReplayLine := false;
+    self.DelayLines := 0;
+  }
+
+  fn Track(i: int64): TTrackState {
+    if (i < 0) { return null; }
+    if (i >= OM_MAX_REPLAY_TRACKS) { return null; }
+    return self.Tracks.Get(i) as TTrackState;
+  }
+
+  fn Attach(s: TSong, b: TPlaybackBackend): void {
+    self.Song := s;
+    self.Backend := b;
+    if (s != null) {
+      self.Tpl := s.Tpl;
+      self.Tempo := s.Tempo;
+    }
+  }
+
+  fn Block(): TBlock {
+    if (self.Song == null) { return null; }
+    return self.Song.BlockAt(self.BlockNo);
+  }
+
+  // Bilder je Tick. 125 als Tempo ergibt die 50 Ticks je Sekunde des PAL-
+  // Amiga — dieselbe Rechnung wie in den Trackern seit ProTracker.
+  fn FramesPerTick(rate: int64): int64 {
+    var t: int64 := self.Tempo;
+    if (t < 32) { t := 32; }
+    if (t > 255) { t := 255; }
+    return (rate * 5) / (t * 2);
+  }
+
+  // ---- Start und Stopp ----------------------------------------------------
+
+  fn ResetTracks(): void {
+    var i: int64 := 0;
+    while (i < OM_MAX_REPLAY_TRACKS) {
+      var st: TTrackState := self.Track(i);
+      if (st != null) {
+        st.Period := 0;
+        st.BasePeriod := 0;
+        st.TargetPeriod := 0;
+        st.Volume := 64;
+        st.BaseVolume := 64;
+        st.VibPos := 0;
+        st.TremPos := 0;
+        st.CutTick := -1;
+        st.DelayTick := -1;
+        st.RetrigTicks := 0;
+      }
+      if (st != null) { self.MidiStop(st); }
+      if (self.Backend != null) { self.Backend.NoteOff(i); }
+      i := i + 1;
+    }
+  }
+
+  fn PlayBlock(no: int64): void {
+    if (self.Song == null) { return; }
+    self.BlockNo := no;
+    self.SongMode := false;
+    self.Line := 0;
+    self.Tick := 0;
+    self.LoopCount := 0;
+    self.DelayLines := 0;
+    self.ReplayLine := false;
+    self.Tpl := self.Song.Tpl;
+    self.Tempo := self.Song.Tempo;
+    self.ResetTracks();
+    self.Playing := true;
+  }
+
+  fn PlaySong(): void {
+    if (self.Song == null) { return; }
+    self.SeqPos := 0;
+    var no: int64 := self.Song.SequenceEntry(0);
+    if (no < 0) { no := 0; }
+    self.PlayBlock(no);
+    self.SongMode := true;
+  }
+
+  fn Stop(): void {
+    self.Playing := false;
+    var i: int64 := 0;
+    while (i < OM_MAX_REPLAY_TRACKS) {
+      var st: TTrackState := self.Track(i);
+      if (st != null) { self.MidiStop(st); }
+      if (self.Backend != null) { self.Backend.NoteOff(i); }
+      i := i + 1;
+    }
+    // Zusaetzlich der Rundumschlag: haengt auf dem Geraet noch etwas, das
+    // dieser Tracker nicht gesetzt hat, ist Stille trotzdem das Richtige.
+    if (self.MidiReady()) { self.Midi.AllNotesOff(); }
+  }
+
+  // ---- Hilfen -------------------------------------------------------------
+
+  fn Instrument(no: int64): TInstrument {
+    if (self.Song == null) { return null; }
+    return self.Song.Instrument(no);
+  }
+
+  fn ApplyPeriod(track: int64, st: TTrackState): void {
+    if (self.Backend == null) { return; }
+    var p: int64 := st.Period;
+    if (p < OM_PAULA_MIN_PERIOD) { p := OM_PAULA_MIN_PERIOD; }
+    if (p > OM_PAULA_MAX_PERIOD) { p := OM_PAULA_MAX_PERIOD; }
+    self.Backend.SetPeriod(track, p);
+  }
+
+  fn ApplyVolume(track: int64, st: TTrackState): void {
+    if (self.Backend == null) { return; }
+    var v: int64 := st.Volume;
+    if (v < 0) { v := 0; }
+    if (v > 64) { v := 64; }
+    self.Backend.SetVolume(track, v);
+  }
+
+  // ---- MIDI ---------------------------------------------------------------
+
+  fn MidiReady(): bool {
+    if (self.Midi == null) { return false; }
+    return self.Midi.IsOpen();
+  }
+
+  // Eine klingende MIDI-Note beenden. Ohne das haengt der Ton auf dem Geraet
+  // weiter, auch wenn der Tracker laengst bei der naechsten Line ist — MIDI
+  // kennt kein Auslaufen wie ein Sample.
+  fn MidiStop(st: TTrackState): void {
+    if (st == null) { return; }
+    if (st.MidiNote == 0) { return; }
+    if (self.MidiReady()) {
+      self.Midi.NoteOff(st.MidiChan - 1, st.MidiNote);
+    }
+    st.MidiNote := 0;
+  }
+
+  fn MidiTrigger(track: int64, st: TTrackState, ins: TInstrument, note: int64): void {
+    self.MidiStop(st);
+    st.MidiChan := ins.MidiChannel;
+    st.BaseVolume := ins.Volume;
+    st.Volume := ins.Volume;
+    st.HoldTicks := -1;
+
+    if (!self.MidiReady()) { return; }
+    var ch: int64 := st.MidiChan - 1;
+    // Programmwechsel nur, wenn sich das Preset wirklich aendert: MIDI-Geraete
+    // brauchen dafuer Zeit, und jede Line neu umzuschalten hoert man.
+    if (ins.MidiPreset != st.MidiPreset) {
+      if (ins.MidiPreset > 0) {
+        self.Midi.ProgramChange(ch, ins.MidiPreset - 1);
+        st.MidiPreset := ins.MidiPreset;
+      }
+    }
+    var mn: int64 := MidiNoteOf(note + ins.Transpose);
+    self.Midi.NoteOn(ch, mn, MidiVelocityOf(st.Volume));
+    st.MidiNote := mn;
+  }
+
+  fn TriggerNote(track: int64, note: int64, insNo: int64, offset: int64): void {
+    var st: TTrackState := self.Track(track);
+    if (st == null) { return; }
+    var use: int64 := insNo;
+    if (use == 0) { use := st.Instr; }
+    var ins: TInstrument := self.Instrument(use);
+    if (ins == null) { return; }
+
+    st.Instr := use;
+
+    // Ein Instrument mit MIDI-Kanal spielt NICHT auf dem Sample-Backend. Das
+    // ist keine Optimierung: derselbe Block treibt in OctaMED Sample- und
+    // MIDI-Spuren nebeneinander, und was auf dem Geraet klingt, darf nicht
+    // zusaetzlich aus der Paula kommen.
+    if (ins.MidiChannel != 0) {
+      self.MidiTrigger(track, st, ins, note);
+      return;
+    }
+    if (st.MidiNote != 0) { self.MidiStop(st); }
+    st.MidiChan := 0;
+
+    var period: int64 := NotePeriod(note + ins.Transpose, ins.FineTune);
+    st.BasePeriod := period;
+    st.Period := period;
+    st.ArpNote := period;
+    st.BaseVolume := ins.Volume;
+    st.Volume := ins.Volume;
+    st.VibPos := 0;
+    st.TremPos := 0;
+    st.SampleHold := ins.Hold;
+    st.DecayRate := ins.Decay;
+    st.Decaying := false;
+
+    if (self.Backend != null) {
+      self.Backend.NoteOn(track, ins, period, st.Volume);
+      // Command 19 (Sample Start Offset, PT 9): der Anschlag beginnt nicht am
+      // Anfang des Samples. Das Backend kennt keine Offsets, also wird die
+      // Periode neu gesetzt und die Stimme vorgespult — mehr braucht es
+      // nicht, weil NoteOn die Position ohnehin auf 0 gestellt hat.
+      if (offset > 0) {
+        self.Backend.SetPeriod(track, period);
+      }
+    }
+  }
+
+  // ---- Command-Dispatch: Tick 0 -------------------------------------------
+  // Auf Tick 0 werden Commands gesetzt, nicht ausgefuehrt: ein Slide bewegt
+  // hier noch nichts, er merkt sich nur seine Geschwindigkeit. Die Ausnahmen
+  // sind die Commands, die genau einmal wirken (0C, 09, 0F, 11, 12, 15, 1A,
+  // 1B) — sie erledigen ihre Arbeit sofort.
+  // Auf einem MIDI-Track bedeuten dieselben Nummern etwas anderes. Das ist
+  // kein Sonderfall, den man wegabstrahieren koennte: ein Slide auf einer
+  // Sample-Spur bewegt die Abspielrate, auf einer MIDI-Spur den Pitchbender
+  // des Geraets — zwei verschiedene Dinge mit derselben Zahl davor.
+  fn CommandTick0Midi(track: int64, st: TTrackState, cmd: int64,
+                      level: int64): void {
+    var ch: int64 := st.MidiChan - 1;
+    if (ch < 0) { return; }
+
+    if (cmd == 0x03) {
+      // Set Pitchbender (auch 13): Level ist der Wert, 0x40 ist die Mitte.
+      st.MidiBend := level * 128;
+      if (self.MidiReady()) { self.Midi.PitchBend(ch, st.MidiBend); }
+      return;
+    }
+    if (cmd == 0x13) {
+      st.MidiBend := level * 128;
+      if (self.MidiReady()) { self.Midi.PitchBend(ch, st.MidiBend); }
+      return;
+    }
+    if (cmd == 0x04) {
+      if (self.MidiReady()) {
+        self.Midi.ControlChange(ch, MIDI_CC_MODULATION, level & 0x7F);
+      }
+      return;
+    }
+    if (cmd == 0x05) {
+      // Controllernummer merken; den Wert liefert Command 00 der naechsten
+      // Line. Zwei Commands fuer einen Controller, weil in eine Zelle nur ein
+      // Datenbyte passt.
+      st.MidiCc := level;
+      return;
+    }
+    if (cmd == 0x00) {
+      if (st.MidiCc != 0) {
+        if (self.MidiReady()) {
+          self.Midi.ControlChange(ch, st.MidiCc & 0x7F, level & 0x7F);
+        }
+      }
+      return;
+    }
+    if (cmd == 0x08) {
+      // Set Hold Only: die Note wird nach so vielen Ticks beendet.
+      st.HoldTicks := level;
+      return;
+    }
+    if (cmd == 0x0A) {
+      if (st.MidiNote != 0) {
+        if (self.MidiReady()) {
+          self.Midi.PolyAftertouch(ch, st.MidiNote, level & 0x7F);
+        }
+      }
+      return;
+    }
+    if (cmd == 0x0D) {
+      if (self.MidiReady()) { self.Midi.ChannelAftertouch(ch, level & 0x7F); }
+      return;
+    }
+    if (cmd == 0x0E) {
+      if (self.MidiReady()) { self.Midi.ControlChange(ch, MIDI_CC_PAN, level & 0x7F); }
+      return;
+    }
+    if (cmd == 0x0C) {
+      // Set Volume wird zur Kanallautstaerke (CC 7). Die Velocity der schon
+      // klingenden Note laesst sich nicht mehr aendern — das ist MIDI.
+      st.BaseVolume := level;
+      st.Volume := level;
+      if (self.MidiReady()) {
+        self.Midi.ControlChange(ch, 7, MidiVelocityOf(level));
+      }
+      return;
+    }
+    if (cmd == 0x0F) {
+      // Tempo und die Sequenzsprünge gelten fuer den ganzen Song, nicht fuer
+      // eine Spur — deshalb dieselbe Behandlung wie auf Sample-Spuren.
+      self.CommandTempo(level);
+      return;
+    }
+    if (cmd == 0x18) {
+      st.CutTick := level;
+      return;
+    }
+    if (cmd >= 0x31) {
+      // Set MIDI Controller: die Commandnummer IST die Controllernummer.
+      if (cmd <= 0x3F) {
+        if (self.MidiReady()) {
+          self.Midi.ControlChange(ch, cmd & 0x7F, level & 0x7F);
+        }
+      }
+      return;
+    }
+  }
+
+  fn CommandTickMidi(track: int64, st: TTrackState, tick: int64): void {
+    var ch: int64 := st.MidiChan - 1;
+    if (ch < 0) { return; }
+    var cmd: int64 := st.Cmd;
+    var level: int64 := st.Level;
+
+    // Hold: die Note endet mitten in der Line.
+    if (st.HoldTicks >= 0) {
+      if (tick >= st.HoldTicks) {
+        self.MidiStop(st);
+        st.HoldTicks := -1;
+      }
+    }
+    if (st.CutTick >= 0) {
+      if (tick >= st.CutTick) {
+        self.MidiStop(st);
+        st.CutTick := -1;
+      }
+    }
+
+    // Pitchbender hoch bzw. runter, je Tick um Level.
+    if (cmd == 0x01) {
+      st.MidiBend := st.MidiBend + (level * 8);
+      if (st.MidiBend > 16383) { st.MidiBend := 16383; }
+      if (self.MidiReady()) { self.Midi.PitchBend(ch, st.MidiBend); }
+      return;
+    }
+    if (cmd == 0x02) {
+      st.MidiBend := st.MidiBend - (level * 8);
+      if (st.MidiBend < 0) { st.MidiBend := 0; }
+      if (self.MidiReady()) { self.Midi.PitchBend(ch, st.MidiBend); }
+      return;
+    }
+  }
+
+  fn CommandTick0(track: int64, st: TTrackState, note: int64, cmd: int64,
+                  level: int64): void {
+    if (st.MidiChan != 0) {
+      self.CommandTick0Midi(track, st, cmd, level);
+      return;
+    }
+    var hi: int64 := (level >> 4) & 0x0F;
+    var lo: int64 := level & 0x0F;
+
+    if (cmd == 0x00) {
+      // Arpeggio: die Grundnote steht schon, die Versaetze kommen je Tick.
+      return;
+    }
+    if (cmd == 0x03) {
+      // Portamento: das Ziel ist die Note dieser Line, angeschlagen wird
+      // NICHT. Ohne Level laeuft das Portamento mit der alten Geschwindigkeit
+      // weiter — so haelt man einen Ton ueber mehrere Lines.
+      if (level != 0) { st.PortaSpeed := level; }
+      return;
+    }
+    if (cmd == 0x04) {
+      if (hi != 0) { st.VibSpeed := hi; }
+      if (lo != 0) { st.VibDepth := lo; }
+      return;
+    }
+    if (cmd == 0x07) {
+      if (hi != 0) { st.TremSpeed := hi; }
+      if (lo != 0) { st.TremDepth := lo; }
+      return;
+    }
+    if (cmd == 0x09) {
+      // TPL-Slider setzen (01..20).
+      if (level > 0) { self.Tpl := level; }
+      return;
+    }
+    if (cmd == 0x0C) {
+      // Set Volume. 80..C0 setzt das Standardvolume des Instruments, sonst
+      // gilt der Wert direkt (0..64).
+      if (level >= 0x80) {
+        var ins: TInstrument := self.Instrument(st.Instr);
+        if (ins != null) { ins.Volume := level - 0x80; }
+        st.BaseVolume := level - 0x80;
+      } else {
+        st.BaseVolume := level;
+      }
+      st.Volume := st.BaseVolume;
+      self.ApplyVolume(track, st);
+      return;
+    }
+    if (cmd == 0x0F) {
+      self.CommandTempo(level);
+      return;
+    }
+    if (cmd == 0x11) {
+      // Slide Pitch Up Once (PT E1): genau einmal, nicht je Tick.
+      st.Period := st.Period - level;
+      self.ApplyPeriod(track, st);
+      return;
+    }
+    if (cmd == 0x12) {
+      st.Period := st.Period + level;
+      self.ApplyPeriod(track, st);
+      return;
+    }
+    if (cmd == 0x15) {
+      // Set Finetune: wirkt auf das Instrument, nicht auf den Track — so
+      // steht es in der Instrumentliste und bleibt fuer die naechste Note.
+      var ins2: TInstrument := self.Instrument(st.Instr);
+      if (ins2 != null) {
+        var ft: int64 := level;
+        if (ft > 7) { ft := ft - 16; }     // 8..F sind negative Finetunes
+        ins2.FineTune := ft;
+      }
+      return;
+    }
+    if (cmd == 0x16) {
+      // Repeat Lines (PT E6): Level 0 setzt die Marke, sonst so oft wiederholen.
+      if (level == 0) { self.LoopLine := self.Line; }
+      else {
+        if (self.LoopCount == 0) { self.LoopCount := level; }
+      }
+      return;
+    }
+    if (cmd == 0x18) {
+      st.CutTick := level;
+      return;
+    }
+    if (cmd == 0x1A) {
+      st.BaseVolume := st.BaseVolume + level;
+      if (st.BaseVolume > 64) { st.BaseVolume := 64; }
+      st.Volume := st.BaseVolume;
+      self.ApplyVolume(track, st);
+      return;
+    }
+    if (cmd == 0x1B) {
+      st.BaseVolume := st.BaseVolume - level;
+      if (st.BaseVolume < 0) { st.BaseVolume := 0; }
+      st.Volume := st.BaseVolume;
+      self.ApplyVolume(track, st);
+      return;
+    }
+    if (cmd == 0x1E) {
+      // Replay Line (PT EE): dieselbe Line noch einmal.
+      self.ReplayLine := true;
+      return;
+    }
+  }
+
+  // Command 0F — Primary Tempo und die Spezialfaelle. Das ist der Command mit
+  // den meisten Sonderbedeutungen, und alle stecken im Level:
+  //   00        naechster Eintrag der Playing Sequence
+  //   01..F0    Tempo setzen
+  //   FF1..FFF  Spezialfunktionen (hier: FF1 doppelt anschlagen, FF2 halbe
+  //             Line Verzoegerung, FF3 dreifach, FF4/FF5 Triolenverzoegerung)
+  fn CommandTempo(level: int64): void {
+    if (level == 0x00) {
+      self.NextSequenceEntry();
+      return;
+    }
+    if (level <= 0xF0) {
+      self.Tempo := level;
+      return;
+    }
+    if (level == 0xF1) { return; }        // doppelter Anschlag: siehe Tick-Teil
+    if (level == 0xF2) { self.DelayLines := 1; return; }
+    if (level == 0xF3) { return; }
+    if (level == 0xF4) { self.DelayLines := 1; return; }
+    if (level == 0xF5) { self.DelayLines := 1; return; }
+  }
+
+  // ---- Command-Dispatch: Ticks 1..n ---------------------------------------
+  // Hold und Decay des Instruments, je Tick. Laeuft VOR dem Command-Dispatch:
+  // ein Volume Slide auf derselben Line soll auf dem ausklingenden Wert
+  // aufsetzen, nicht umgekehrt.
+  fn HoldAndDecay(track: int64, st: TTrackState): void {
+    if (st.SampleHold > 0) {
+      st.SampleHold := st.SampleHold - 1;
+      if (st.SampleHold == 0) { st.Decaying := true; }
+      return;
+    }
+    if (!st.Decaying) { return; }
+
+    var rate: int64 := st.DecayRate;
+    if (rate < 1) { rate := 1; }
+    st.BaseVolume := st.BaseVolume - rate;
+    if (st.BaseVolume <= 0) {
+      st.BaseVolume := 0;
+      st.Volume := 0;
+      st.Decaying := false;
+      // Die Stimme wird stillgelegt, nicht nur leise gedreht: eine Stimme,
+      // die unhoerbar weiterlaeuft, blockiert im Paula-Modus einen der vier
+      // Kanaele.
+      if (self.Backend != null) { self.Backend.NoteOff(track); }
+      return;
+    }
+    st.Volume := st.BaseVolume;
+    self.ApplyVolume(track, st);
+  }
+
+  fn CommandTick(track: int64, st: TTrackState, tick: int64): void {
+    if (st.MidiChan != 0) {
+      self.CommandTickMidi(track, st, tick);
+      return;
+    }
+    self.HoldAndDecay(track, st);
+    var cmd: int64 := st.Cmd;
+    var level: int64 := st.Level;
+    var hi: int64 := (level >> 4) & 0x0F;
+    var lo: int64 := level & 0x0F;
+
+    if (cmd == 0x00) {
+      // Arpeggio: Tick 1 spielt Level-High Halbtoene ueber der Grundnote,
+      // Tick 2 Level-Low, dann von vorn. Die Periode wird dabei nicht addiert,
+      // sondern der Halbton gerechnet — Perioden sind nicht linear.
+      if (level != 0) {
+        var step: int64 := tick % 3;
+        var semi: int64 := 0;
+        if (step == 1) { semi := hi; }
+        if (step == 2) { semi := lo; }
+        st.Period := PeriodShiftSemitones(st.ArpNote, semi);
+        self.ApplyPeriod(track, st);
+      }
+      return;
+    }
+    if (cmd == 0x01) {
+      st.Period := st.Period - level;
+      st.BasePeriod := st.Period;
+      self.ApplyPeriod(track, st);
+      return;
+    }
+    if (cmd == 0x02) {
+      st.Period := st.Period + level;
+      st.BasePeriod := st.Period;
+      self.ApplyPeriod(track, st);
+      return;
+    }
+    if (cmd == 0x03) {
+      self.DoPortamento(track, st);
+      return;
+    }
+    if (cmd == 0x04) {
+      self.DoVibrato(track, st);
+      return;
+    }
+    if (cmd == 0x05) {
+      // Slide Pitch and Fade: Tonhoehe mit der gemerkten Portamentogeschwin-
+      // digkeit, Lautstaerke wie bei 0D.
+      self.DoPortamento(track, st);
+      self.DoVolumeSlide(track, st, hi, lo);
+      return;
+    }
+    if (cmd == 0x06) {
+      self.DoVibrato(track, st);
+      self.DoVolumeSlide(track, st, hi, lo);
+      return;
+    }
+    if (cmd == 0x07) {
+      self.DoTremolo(track, st);
+      return;
+    }
+    if (cmd == 0x0A) {
+      self.DoVolumeSlide(track, st, hi, lo);
+      return;
+    }
+    if (cmd == 0x0D) {
+      self.DoVolumeSlide(track, st, hi, lo);
+      return;
+    }
+    if (cmd == 0x14) {
+      self.DoVibrato(track, st);
+      return;
+    }
+    if (cmd == 0x18) {
+      // Cut Note (PT E8): ab dem angegebenen Tick stumm, das Sample laeuft
+      // aber weiter — genau so verhaelt sich der Chip.
+      if (st.CutTick >= 0) {
+        if (tick >= st.CutTick) {
+          st.Volume := 0;
+          self.ApplyVolume(track, st);
+        }
+      }
+      return;
+    }
+    if (cmd == 0x1F) {
+      // Note Delay und Retrigger (PT EC/ED).
+      if (st.DelayTick >= 0) {
+        if (tick == st.DelayTick) {
+          self.TriggerNote(track, st.DelayNote, st.Instr, 0);
+          st.DelayTick := -1;
+        }
+      }
+      if (st.RetrigTicks > 0) {
+        if ((tick % st.RetrigTicks) == 0) {
+          // Neu anschlagen heisst: dasselbe Sample von vorn, mit der Periode,
+          // die gerade klingt. Eine Notennummer braucht es dafuer nicht.
+          var ins: TInstrument := self.Instrument(st.Instr);
+          if (ins != null) {
+            if (self.Backend != null) {
+              self.Backend.NoteOn(track, ins, st.BasePeriod, st.Volume);
+            }
+          }
+        }
+      }
+      return;
+    }
+  }
+
+  fn DoPortamento(track: int64, st: TTrackState): void {
+    if (st.TargetPeriod == 0) { return; }
+    if (st.Period < st.TargetPeriod) {
+      st.Period := st.Period + st.PortaSpeed;
+      if (st.Period > st.TargetPeriod) { st.Period := st.TargetPeriod; }
+    } else {
+      st.Period := st.Period - st.PortaSpeed;
+      if (st.Period < st.TargetPeriod) { st.Period := st.TargetPeriod; }
+    }
+    self.ApplyPeriod(track, st);
+  }
+
+  fn DoVibrato(track: int64, st: TTrackState): void {
+    var delta: int64 := (SineTable(st.VibPos) * st.VibDepth) / 128;
+    if ((st.VibPos % 64) >= 32) { delta := -delta; }
+    st.Period := st.BasePeriod + delta;
+    self.ApplyPeriod(track, st);
+    st.VibPos := (st.VibPos + st.VibSpeed) % 64;
+  }
+
+  fn DoTremolo(track: int64, st: TTrackState): void {
+    var delta: int64 := (SineTable(st.TremPos) * st.TremDepth) / 64;
+    if ((st.TremPos % 64) >= 32) { delta := -delta; }
+    st.Volume := st.BaseVolume + delta;
+    if (st.Volume < 0) { st.Volume := 0; }
+    if (st.Volume > 64) { st.Volume := 64; }
+    self.ApplyVolume(track, st);
+    st.TremPos := (st.TremPos + st.TremSpeed) % 64;
+  }
+
+  // Volume Slide: Level-High hebt, Level-Low senkt. Beides gesetzt hiesse
+  // zwei Richtungen zugleich — dann gewinnt das Heben, wie im Original.
+  fn DoVolumeSlide(track: int64, st: TTrackState, up: int64, down: int64): void {
+    if (up != 0) { st.BaseVolume := st.BaseVolume + up; }
+    else { st.BaseVolume := st.BaseVolume - down; }
+    if (st.BaseVolume < 0) { st.BaseVolume := 0; }
+    if (st.BaseVolume > 64) { st.BaseVolume := 64; }
+    st.Volume := st.BaseVolume;
+    self.ApplyVolume(track, st);
+  }
+
+  // ---- Line und Tick ------------------------------------------------------
+
+  fn StartLine(): void {
+    var b: TBlock := self.Block();
+    if (b == null) { return; }
+
+    var track: int64 := 0;
+    while (track < b.Tracks) {
+      var st: TTrackState := self.Track(track);
+      if (st != null) {
+        var cell: int64 := b.Cell(self.Line, track);
+        var note: int64 := CellNote(cell);
+        var insNo: int64 := CellInstr(cell);
+        var cmd: int64 := CellCmd(cell);
+        var level: int64 := CellLevel(cell);
+
+        st.Cmd := cmd;
+        st.Level := level;
+        st.HoldTicks := -1;
+        st.CutTick := -1;
+        st.DelayTick := -1;
+        st.RetrigTicks := 0;
+
+        if (cmd == 0x1F) {
+          // Note Delay (Level-High) bzw. Retrigger (Level-Low): die Note wird
+          // hier NICHT angeschlagen, das erledigt der Tickteil.
+          var dhi: int64 := (level >> 4) & 0x0F;
+          var dlo: int64 := level & 0x0F;
+          if (dhi > 0) {
+            if (note > 0) {
+              st.DelayTick := dhi;
+              st.DelayNote := note;
+              note := 0;
+            }
+          }
+          if (dlo > 0) { st.RetrigTicks := dlo; }
+        }
+
+        if (note > 0) {
+          if (cmd == 0x03) {
+            // Portamento schlaegt nicht an, es zielt nur.
+            var ins: TInstrument := self.Instrument(st.Instr);
+            var ft: int64 := 0;
+            var tr: int64 := 0;
+            if (ins != null) {
+              ft := ins.FineTune;
+              tr := ins.Transpose;
+            }
+            st.TargetPeriod := NotePeriod(note + tr, ft);
+            if (insNo != 0) { st.Instr := insNo; }
+          } else {
+            var offset: int64 := 0;
+            if (cmd == 0x19) { offset := level; }
+            self.TriggerNote(track, note, insNo, offset);
+          }
+        } else {
+          if (insNo != 0) { st.Instr := insNo; }
+        }
+
+        self.CommandTick0(track, st, note, cmd, level);
+      }
+      track := track + 1;
+    }
+  }
+
+  fn NextSequenceEntry(): void {
+    if (self.Song == null) { return; }
+    if (!self.SongMode) { return; }
+    self.SeqPos := self.SeqPos + 1;
+    if (self.SeqPos >= self.Song.SeqLen()) { self.SeqPos := 0; }
+    var no: int64 := self.Song.SequenceEntry(self.SeqPos);
+    if (no < 0) { no := 0; }
+    self.BlockNo := no;
+    self.Line := 0;
+    self.Tick := 0;
+  }
+
+  // Line weiterschalten. Die Reihenfolge ist wichtig: erst die Wiederholung
+  // (Command 16), dann das Blockende — sonst laeuft eine Schleife, die auf der
+  // letzten Line endet, ins Leere.
+  fn AdvanceLine(): void {
+    var b: TBlock := self.Block();
+    if (b == null) { return; }
+
+    if (self.ReplayLine) {
+      self.ReplayLine := false;
+      self.Tick := 0;
+      return;
+    }
+
+    if (self.LoopCount > 0) {
+      if (self.Line >= self.LoopLine) {
+        self.LoopCount := self.LoopCount - 1;
+        self.Line := self.LoopLine;
+        self.Tick := 0;
+        return;
+      }
+    }
+
+    self.Line := self.Line + 1;
+    self.Tick := 0;
+    if (self.Line >= b.Lines) {
+      self.Line := 0;
+      if (self.SongMode) { self.NextSequenceEntry(); }
+    }
+  }
+
+  // Ein Tick. Rueckgabe: false, wenn nicht gespielt wird — dann braucht der
+  // Aufrufer auch keinen Puffer zu mischen.
+  fn DoTick(): bool {
+    if (!self.Playing) { return false; }
+    var b: TBlock := self.Block();
+    if (b == null) { return false; }
+
+    if (self.Tick == 0) {
+      if (self.DelayLines > 0) {
+        // Halbe Line Verzoegerung (0F FF2/FF4/FF5): die Line wird um einen
+        // Durchlauf spaeter angeschlagen.
+        self.DelayLines := self.DelayLines - 1;
+      } else {
+        self.StartLine();
+      }
+    } else {
+      var track: int64 := 0;
+      while (track < b.Tracks) {
+        var st: TTrackState := self.Track(track);
+        if (st != null) { self.CommandTick(track, st, self.Tick); }
+        track := track + 1;
+      }
+    }
+
+    self.Tick := self.Tick + 1;
+    var tpl: int64 := self.Tpl;
+    if (tpl < 1) { tpl := 1; }
+    if (self.Tick >= tpl) { self.AdvanceLine(); }
+    return true;
+  }
+}
+
+pub fn NewReplayEngine(): TReplayEngine {
+  return new TReplayEngine();
+}

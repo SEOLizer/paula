@@ -1,0 +1,106 @@
+// playtest.lyx — die Wiedergabekette so fahren wie im Programm, aber mit
+// Zaehlern: laeuft der Ton durch, oder bricht er nach dem ersten Block ab?
+import std.io;
+import std.time;
+import OMED.Song;
+import OMED.Sample;
+import OMED.Playback;
+import OMED.Replay;
+import OMED.Audio;
+import OMED.MOD;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintIntLn(v);
+}
+
+fn BuildDemo(): TSong {
+  var s: TSong := NewSong("Playtest");
+  var ins: TInstrument := NewInstrument("Square");
+  MakeSquareSample(ins, 48, 40);
+  ins.Volume := 64;
+  s.AddInstrument(ins);
+
+  var b: TBlock := NewBlock(4, 16);
+  var line: int64 := 0;
+  while (line < 16) {
+    if ((line % 2) == 0) {
+      var note: int64 := 25;
+      if ((line % 8) == 4) { note := 32; }
+      b.PutCell(line, 0, CellPack(note, 1, 0, 0));
+    }
+    line := line + 1;
+  }
+  s.AddBlock(b);
+  s.AddSequenceEntry(0);
+  return s;
+}
+
+fn main(): int64 {
+  var song: TSong := LoadMOD("/home/andreas/PhpstormProjects/lyx-octaMED/alone.mod");
+  if (song == null) { song := BuildDemo(); }
+  else { PrintStrLn("spielt alone.mod"); }
+  var backend: TPlaybackBackend := NewOctaMed8ChannelBackend() as TPlaybackBackend;
+  backend.Init(OM_MIX_RATE);
+
+  var audio: TOmedAudio := NewOmedAudio();
+  if (!audio.Open()) { PrintStrLn("kein Audiogeraet"); return 1; }
+  if (!audio.Prepare()) { PrintStrLn("Geraet nicht konfigurierbar"); return 2; }
+
+  var e: TReplayEngine := NewReplayEngine();
+  e.Attach(song, backend);
+  e.PlaySong();
+
+  var frames: int64 := e.FramesPerTick(OM_MIX_RATE);
+  var buf: int64 := alloc(frames * 4);
+
+  var start: int64 := NowMs();
+  var geschrieben: int64 := 0;
+  var fehler: int64 := 0;
+  var leerlauf: int64 := 0;
+
+  var maxDelay: int64 := 0;
+  var summe: int64 := 0;
+  var proben: int64 := 0;
+
+  // Dieselbe Schleife wie der Timer im Programm: rendern, bis der Vorlauf
+  // erreicht ist.
+  var vorlauf: int64 := frames * 30;
+  while (NowMs() - start < 15000) {
+    var d: int64 := audio.Delay();
+    if (d > maxDelay) { maxDelay := d; }
+    summe := summe + d;
+    proben := proben + 1;
+
+    if (d >= vorlauf) { leerlauf := leerlauf + 1; }
+    else {
+      if (audio.Avail() < frames) { leerlauf := leerlauf + 1; }
+      else {
+      e.DoTick();
+      var i: int64 := 0;
+      while (i < frames * 4) { poke8(buf + i, 0); i := i + 1; }
+      backend.RenderTick(buf, frames);
+      if (audio.WriteFrames(buf, frames)) { geschrieben := geschrieben + frames; }
+      else { fehler := fehler + 1; }
+      }
+    }
+  }
+
+  var dauer: int64 := NowMs() - start;
+  Show("dauer ms", dauer);
+  Show("geschriebene bilder", geschrieben);
+  Show("davon ms ton", (geschrieben * 1000) / OM_MIX_RATE);
+  Show("fehlgeschlagene schreibvorgaenge", fehler);
+  Show("durchlaeufe ohne platz", leerlauf);
+  Show("gespielte line am ende", e.Line);
+  Show("groesster vorlauf (bilder)", maxDelay);
+  Show("groesster vorlauf (ms)", (maxDelay * 1000) / OM_MIX_RATE);
+  if (proben > 0) {
+    Show("mittlerer vorlauf (ms)", ((summe / proben) * 1000) / OM_MIX_RATE);
+  }
+
+  audio.Flush();
+  audio.Close();
+  return 0;
+}

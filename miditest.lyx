@@ -1,0 +1,83 @@
+// miditest.lyx — Pruefprogramm fuer die MIDI-Ausgabe (Phase 9). Geschrieben
+// wird in eine Datei statt in eine Geraetedatei; der Bytestrom ist derselbe
+// und laesst sich danach nachrechnen.
+import std.io;
+import OMED.Song;
+import OMED.Sample;
+import OMED.Playback;
+import OMED.Midi;
+import OMED.Replay;
+
+con OUT: pchar := "/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/midi.out";
+
+fn Check(label: pchar, got: int64, want: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintInt(got);
+  if (got == want) { PrintStrLn("  OK"); }
+  else {
+    PrintStr("  ERWARTET ");
+    PrintIntLn(want);
+  }
+}
+
+fn Run(e: TReplayEngine, n: int64): void {
+  var i: int64 := 0;
+  while (i < n) {
+    e.DoTick();
+    i := i + 1;
+  }
+}
+
+fn main(): int64 {
+  Check("note C-3 -> midi", MidiNoteOf(25), 60);
+  Check("note C-1 -> midi", MidiNoteOf(1), 36);
+  Check("volume 64 -> velocity", MidiVelocityOf(64), 127);
+  Check("volume 32 -> velocity", MidiVelocityOf(32), 63);
+
+  var midi: TMidiOut := NewMidiOut();
+  if (!midi.Open(OUT)) { PrintStrLn("MIDI: Datei nicht offen"); return 1; }
+  Check("midi offen", midi.IsOpen() as int64, 1);
+
+  var song: TSong := NewSong("MIDI Test");
+
+  // Instrument 1: MIDI, Kanal 1, Preset 5.
+  var m: TInstrument := NewInstrument("MIDI Lead");
+  m.MidiChannel := 1;
+  m.MidiPreset := 5;
+  m.Volume := 64;
+  song.AddInstrument(m);
+
+  // Instrument 2: gewoehnliches Sample — es darf nicht ueber MIDI gehen.
+  var samp: TInstrument := NewInstrument("Square");
+  MakeSquareSample(samp, 32, 60);
+  song.AddInstrument(samp);
+
+  var b: TBlock := NewBlock(2, 8);
+  b.PutCell(0, 0, CellPack(25, 1, 0x00, 0x00));   // C-3 auf MIDI
+  b.PutCell(1, 0, CellPack(0, 0, 0x0E, 0x40));    // Pan (CC 10) 64
+  b.PutCell(2, 0, CellPack(0, 0, 0x0C, 0x20));    // Volume -> CC 7
+  b.PutCell(3, 0, CellPack(37, 1, 0x00, 0x00));   // C-4: alte Note aus, neue an
+  b.PutCell(0, 1, CellPack(25, 2, 0x00, 0x00));   // Sample-Spur
+  song.AddBlock(b);
+
+  var mix: TSoftwareMixerBackend := NewSoftwareMixerBackend(8);
+  mix.Init(OM_MIX_RATE);
+
+  var e: TReplayEngine := NewReplayEngine();
+  e.Attach(song, mix as TPlaybackBackend);
+  e.Midi := midi;
+
+  e.PlayBlock(0);
+  Run(e, 4 * 6);
+
+  Check("midi kanal track 0", e.Track(0).MidiChan, 1);
+  Check("kein midi auf track 1", e.Track(1).MidiChan, 0);
+  Check("sample-stimme aktiv", mix.ActiveVoices(), 1);
+
+  e.Stop();
+  Check("midi note aus", e.Track(0).MidiNote, 0);
+  midi.Close();
+  PrintStrLn("fertig");
+  return 0;
+}

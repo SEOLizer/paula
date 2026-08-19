@@ -1,0 +1,540 @@
+// OMED/Dialogs.lyx — die kleinen Fenster.
+//
+// OctaMED hatte keine eingeblendeten Bereiche im Hauptfenster, sondern echte
+// kleine Fenster: Block Properties, Song Sequence, Instrument Properties. Das
+// ist kein Zierrat — man laesst die Sequence offen, waehrend man im Block
+// tippt, und genau das kann ein Panel nicht.
+//
+// Phase 8 bringt zwei davon: Block Properties und Song Sequence (inklusive
+// Sections).
+
+@description("OctaMED-Tracker - Dialogfenster")
+@author("Andreas Roene")
+unit OMED.Dialogs;
+
+import Vega.Types;
+import Vega.Control;
+import Vega.Forms;
+import Vega.StdCtrls;
+import Vega.Edits;
+import Vega.Strings;
+import Vega.Font;
+import OMED.Theme;
+import OMED.Song;
+import OMED.Widgets;
+import OMED.Midi;
+
+// Zahl aus einem Eingabefeld. Alles, was keine Ziffer ist, beendet die Zahl —
+// ein Feld, das bei einem Tippfehler eine riesige Blocklaenge liefert, waere
+// gefaehrlicher als eines, das die Eingabe frueh abschneidet.
+pub fn ParseInt(s: pchar): int64 {
+  var p: int64 := s as int64;
+  if (p == 0) { return 0; }
+  var v: int64 := 0;
+  var i: int64 := 0;
+  while (true) {
+    var c: int64 := peek8(p + i);
+    if (c == 0) { return v; }
+    if (c < 48) { return v; }
+    if (c > 57) { return v; }
+    v := (v * 10) + (c - 48);
+    if (v > 100000) { return 100000; }
+    i := i + 1;
+  }
+  return v;
+}
+
+fn IntToText(dst: TTextBuffer, v: int64): void {
+  var buf: int64 := alloc(24);
+  var n: int64 := v;
+  if (n < 0) { n := 0; }
+  var digits: int64 := 1;
+  var t: int64 := n / 10;
+  while (t > 0) { digits := digits + 1; t := t / 10; }
+  poke8(buf + digits, 0);
+  var i: int64 := digits;
+  while (i > 0) {
+    i := i - 1;
+    poke8(buf + i, 48 + (n % 10));
+    n := n / 10;
+  }
+  dst.SetText(buf as pchar);
+  free(buf, 24);
+}
+
+fn AddLabel(owner: TControl, x: int64, y: int64, caption: pchar): TLabel {
+  var l: TLabel := new TLabel(caption);
+  l.Left := x;
+  l.Top := y;
+  l.Width := 110;
+  l.Height := 18;
+  owner.AddChild(l);
+  return l;
+}
+
+fn AddEdit(owner: TControl, x: int64, y: int64, w: int64, text: pchar): TEdit {
+  var e: TEdit := new TEdit(text);
+  e.Left := x;
+  e.Top := y;
+  e.Width := w;
+  e.Height := 22;
+  owner.AddChild(e);
+  return e;
+}
+
+// ============================================================================
+// Block Properties
+// ============================================================================
+// Name, Trackzahl und Linezahl — in OctaMED gehoeren die dem Block und nicht
+// dem Song (anders als bei ProTracker, wo alle Patterns gleich gross sind).
+// Genau deshalb steht das hier in einem Blockfenster.
+
+var _bp_result: int64;
+var _bp_form: TForm;
+
+fn BpOk(sender: TControl): void {
+  _bp_result := mrOk;
+  if (_bp_form != null) { _bp_form.ModalResult := mrOk; }
+}
+
+fn BpCancel(sender: TControl): void {
+  _bp_result := mrCancel;
+  if (_bp_form != null) { _bp_form.ModalResult := mrCancel; }
+}
+
+pub fn ShowBlockProperties(app: TApplication, b: TBlock, blockNo: int64): bool {
+  if (b == null) { return false; }
+
+  var f: TForm := NewForm(300, 190, "Block Properties");
+  f.Position := POS_MAIN_CENTER;
+  _bp_form := f;
+  _bp_result := mrCancel;
+
+  AddLabel(f as TControl, 12, 14, "Name:");
+  var eName: TEdit := AddEdit(f as TControl, 110, 12, 170, b.Name);
+
+  AddLabel(f as TControl, 12, 46, "Tracks:");
+  var tb: TTextBuffer := new TTextBuffer();
+  IntToText(tb, b.Tracks);
+  var eTracks: TEdit := AddEdit(f as TControl, 110, 44, 60, tb.AsPChar());
+
+  AddLabel(f as TControl, 12, 78, "Lines:");
+  IntToText(tb, b.Lines);
+  var eLines: TEdit := AddEdit(f as TControl, 110, 76, 60, tb.AsPChar());
+
+  var bOk: TOmedButton := NewOmedButton("OK");
+  bOk.Left := 110;
+  bOk.Top := 130;
+  bOk.Width := 80;
+  bOk.OnClick := BpOk;
+  f.AddChild(bOk);
+
+  var bCancel: TOmedButton := NewOmedButton("Cancel");
+  bCancel.Left := 198;
+  bCancel.Top := 130;
+  bCancel.Width := 82;
+  bCancel.OnClick := BpCancel;
+  f.AddChild(bCancel);
+
+  f.Dispatcher.SetFocus(eName as TControl);
+  var res: int64 := app.ShowModal(f);
+
+  var ok: bool := false;
+  if (res == mrOk) {
+    // Der Name wird kopiert: das Eingabefeld gibt seinen eigenen Puffer
+    // heraus, und der stirbt mit dem Fenster.
+    var nb: TTextBuffer := new TTextBuffer();
+    nb.SetText(eName.GetText());
+    b.Name := nb.AsPChar();
+    b.Resize(ParseInt(eTracks.GetText()), ParseInt(eLines.GetText()));
+    ok := true;
+  }
+
+  tb.Destroy();
+  _bp_form := null;
+  return ok;
+}
+
+// ============================================================================
+// Song Sequence
+// ============================================================================
+// Die Playing Sequence als das, was sie ist: eine Liste von Blocknummern, in
+// der ein Block mehrfach vorkommen darf. Darueber die Sections (V5) — mehrere
+// solcher Listen nebeneinander.
+
+var _sq_form: TForm;
+var _sq_song: TSong;
+var _sq_list: TOmedList;
+var _sq_title: TLabel;
+var _sq_edit: TEdit;
+
+fn SqRefresh(): void {
+  if (_sq_list == null) { return; }
+  if (_sq_song == null) { return; }
+  var seq: TPlaySeq := _sq_song.Seq();
+  if (seq == null) { return; }
+
+  var sel: int64 := _sq_list.Sel;
+  _sq_list.ClearEntries();
+  var i: int64 := 0;
+  while (i < seq.Len) {
+    var no: int64 := seq.Get(i);
+    var b: TBlock := _sq_song.BlockAt(no);
+    var name: pchar := "(leer)";
+    if (b != null) { name := b.Name; }
+    // Die Nummer der Liste ist der BLOCK, nicht die Position: beim Lesen
+    // sucht man den Block, die Position zaehlt man ohnehin von oben ab.
+    _sq_list.AddEntry(no, name);
+    i := i + 1;
+  }
+  if (sel >= seq.Len) { sel := seq.Len - 1; }
+  if (sel < 0) { sel := 0; }
+  _sq_list.Sel := sel;
+  _sq_list.Invalidate();
+
+  if (_sq_title != null) {
+    var seqName: pchar := "";
+    if (seq.Name != 0) { seqName := seq.Name; }
+    _sq_title.Caption := seqName;
+    _sq_title.Invalidate();
+  }
+}
+
+// Die Blocknummer, mit der die Knoepfe arbeiten: was im Eingabefeld steht.
+fn SqBlockNo(): int64 {
+  if (_sq_edit == null) { return 0; }
+  var no: int64 := ParseInt(_sq_edit.GetText());
+  if (_sq_song != null) {
+    if (no >= _sq_song.BlockCount) { no := _sq_song.BlockCount - 1; }
+  }
+  if (no < 0) { no := 0; }
+  return no;
+}
+
+fn SqAdd(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  var seq: TPlaySeq := _sq_song.Seq();
+  if (seq == null) { return; }
+  seq.Add(SqBlockNo());
+  SqRefresh();
+}
+
+fn SqInsert(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  var seq: TPlaySeq := _sq_song.Seq();
+  if (seq == null) { return; }
+  seq.Insert(_sq_list.Sel, SqBlockNo());
+  SqRefresh();
+}
+
+fn SqDelete(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  var seq: TPlaySeq := _sq_song.Seq();
+  if (seq == null) { return; }
+  seq.Remove(_sq_list.Sel);
+  SqRefresh();
+}
+
+fn SqUp(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  var seq: TPlaySeq := _sq_song.Seq();
+  if (seq == null) { return; }
+  var i: int64 := _sq_list.Sel;
+  if (i <= 0) { return; }
+  seq.Swap(i, i - 1);
+  _sq_list.Sel := i - 1;
+  SqRefresh();
+}
+
+fn SqDown(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  var seq: TPlaySeq := _sq_song.Seq();
+  if (seq == null) { return; }
+  var i: int64 := _sq_list.Sel;
+  if (i >= seq.Len - 1) { return; }
+  seq.Swap(i, i + 1);
+  _sq_list.Sel := i + 1;
+  SqRefresh();
+}
+
+fn SqPrevSection(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  if (_sq_song.CurSection <= 0) { return; }
+  _sq_song.CurSection := _sq_song.CurSection - 1;
+  SqRefresh();
+}
+
+fn SqNextSection(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  if (_sq_song.CurSection >= _sq_song.SectionCount - 1) { return; }
+  _sq_song.CurSection := _sq_song.CurSection + 1;
+  SqRefresh();
+}
+
+fn SqNewSection(sender: TControl): void {
+  if (_sq_song == null) { return; }
+  _sq_song.CurSection := _sq_song.AddSection("Section");
+  SqRefresh();
+}
+
+fn SqClose(sender: TControl): void {
+  if (_sq_form != null) { _sq_form.ModalResult := mrOk; }
+}
+
+pub fn ShowSequenceWindow(app: TApplication, song: TSong): void {
+  if (song == null) { return; }
+
+  var f: TForm := NewForm(360, 380, "Song Sequence");
+  f.Position := POS_MAIN_CENTER;
+  _sq_form := f;
+  _sq_song := song;
+
+  _sq_title := AddLabel(f as TControl, 10, 8, "");
+  _sq_title.Width := 200;
+
+  var bPrev: TOmedButton := NewOmedButton("<");
+  bPrev.Left := 220; bPrev.Top := 6; bPrev.Width := 32;
+  bPrev.OnClick := SqPrevSection;
+  f.AddChild(bPrev);
+
+  var bNext: TOmedButton := NewOmedButton(">");
+  bNext.Left := 256; bNext.Top := 6; bNext.Width := 32;
+  bNext.OnClick := SqNextSection;
+  f.AddChild(bNext);
+
+  var bNewSec: TOmedButton := NewOmedButton("New");
+  bNewSec.Left := 292; bNewSec.Top := 6; bNewSec.Width := 56;
+  bNewSec.OnClick := SqNewSection;
+  f.AddChild(bNewSec);
+
+  _sq_list := NewOmedList("PLAYING SEQUENCE");
+  _sq_list.Left := 10;
+  _sq_list.Top := 34;
+  _sq_list.Width := 338;
+  _sq_list.Height := 240;
+  f.AddChild(_sq_list as TControl);
+
+  AddLabel(f as TControl, 10, 286, "Block:");
+  _sq_edit := AddEdit(f as TControl, 66, 284, 50, "0");
+
+  var bAdd: TOmedButton := NewOmedButton("Add");
+  bAdd.Left := 126; bAdd.Top := 284; bAdd.Width := 60;
+  bAdd.OnClick := SqAdd;
+  f.AddChild(bAdd);
+
+  var bIns: TOmedButton := NewOmedButton("Insert");
+  bIns.Left := 190; bIns.Top := 284; bIns.Width := 70;
+  bIns.OnClick := SqInsert;
+  f.AddChild(bIns);
+
+  var bDel: TOmedButton := NewOmedButton("Delete");
+  bDel.Left := 264; bDel.Top := 284; bDel.Width := 84;
+  bDel.OnClick := SqDelete;
+  f.AddChild(bDel);
+
+  var bUp: TOmedButton := NewOmedButton("Up");
+  bUp.Left := 10; bUp.Top := 316; bUp.Width := 60;
+  bUp.OnClick := SqUp;
+  f.AddChild(bUp);
+
+  var bDown: TOmedButton := NewOmedButton("Down");
+  bDown.Left := 74; bDown.Top := 316; bDown.Width := 70;
+  bDown.OnClick := SqDown;
+  f.AddChild(bDown);
+
+  var bClose: TOmedButton := NewOmedButton("Close");
+  bClose.Left := 268; bClose.Top := 316; bClose.Width := 80;
+  bClose.OnClick := SqClose;
+  f.AddChild(bClose);
+
+  SqRefresh();
+  app.ShowModal(f);
+
+  _sq_form := null;
+  _sq_song := null;
+  _sq_list := null;
+  _sq_title := null;
+  _sq_edit := null;
+}
+
+// ============================================================================
+// Instrument Properties
+// ============================================================================
+// Die Felder stammen 1:1 aus der MMD-Instrumentstruktur. MIDI-Kanal und
+// -Preset stehen bewusst im selben Fenster wie Volume und Transpose: ob ein
+// Instrument ein Sample oder ein MIDI-Klang ist, entscheidet genau eines
+// dieser Felder (midich), und das soll man sehen, ohne das Fenster zu
+// wechseln.
+
+var _ip_form: TForm;
+
+fn IpOk(sender: TControl): void {
+  if (_ip_form != null) { _ip_form.ModalResult := mrOk; }
+}
+
+fn IpCancel(sender: TControl): void {
+  if (_ip_form != null) { _ip_form.ModalResult := mrCancel; }
+}
+
+pub fn ShowInstrumentProperties(app: TApplication, ins: TInstrument,
+                                number: int64): bool {
+  if (ins == null) { return false; }
+
+  var f: TForm := NewForm(330, 300, "Instrument Properties");
+  f.Position := POS_MAIN_CENTER;
+  _ip_form := f;
+
+  var tb: TTextBuffer := new TTextBuffer();
+
+  AddLabel(f as TControl, 12, 14, "Name:");
+  var eName: TEdit := AddEdit(f as TControl, 130, 12, 180, ins.Name);
+
+  AddLabel(f as TControl, 12, 46, "Volume:");
+  IntToText(tb, ins.Volume);
+  var eVol: TEdit := AddEdit(f as TControl, 130, 44, 60, tb.AsPChar());
+
+  AddLabel(f as TControl, 12, 78, "Transpose:");
+  IntToText(tb, ins.Transpose);
+  var eTrans: TEdit := AddEdit(f as TControl, 130, 76, 60, tb.AsPChar());
+
+  AddLabel(f as TControl, 12, 110, "Fine Tune:");
+  IntToText(tb, ins.FineTune);
+  var eFine: TEdit := AddEdit(f as TControl, 130, 108, 60, tb.AsPChar());
+
+  AddLabel(f as TControl, 12, 142, "MIDI Channel:");
+  IntToText(tb, ins.MidiChannel);
+  var eChan: TEdit := AddEdit(f as TControl, 130, 140, 60, tb.AsPChar());
+
+  AddLabel(f as TControl, 12, 174, "MIDI Preset:");
+  IntToText(tb, ins.MidiPreset);
+  var ePreset: TEdit := AddEdit(f as TControl, 130, 172, 60, tb.AsPChar());
+
+  var bOk: TOmedButton := NewOmedButton("OK");
+  bOk.Left := 140; bOk.Top := 230; bOk.Width := 80;
+  bOk.OnClick := IpOk;
+  f.AddChild(bOk);
+
+  var bCancel: TOmedButton := NewOmedButton("Cancel");
+  bCancel.Left := 228; bCancel.Top := 230; bCancel.Width := 82;
+  bCancel.OnClick := IpCancel;
+  f.AddChild(bCancel);
+
+  f.Dispatcher.SetFocus(eName as TControl);
+  var res: int64 := app.ShowModal(f);
+
+  var ok: bool := false;
+  if (res == mrOk) {
+    var nb: TTextBuffer := new TTextBuffer();
+    nb.SetText(eName.GetText());
+    ins.Name := nb.AsPChar();
+
+    var v: int64 := ParseInt(eVol.GetText());
+    if (v > 64) { v := 64; }
+    ins.Volume := v;
+    ins.Transpose := ParseInt(eTrans.GetText());
+    var ft: int64 := ParseInt(eFine.GetText());
+    if (ft > 7) { ft := 7; }
+    ins.FineTune := ft;
+
+    // MIDI-Kanal 0 heisst "kein MIDI" — das ist der Schalter, der aus einem
+    // Sampleinstrument ein MIDI-Instrument macht.
+    var mc: int64 := ParseInt(eChan.GetText());
+    if (mc > 16) { mc := 16; }
+    ins.MidiChannel := mc;
+    var mp: int64 := ParseInt(ePreset.GetText());
+    if (mp > 128) { mp := 128; }
+    ins.MidiPreset := mp;
+    ok := true;
+  }
+
+  tb.Destroy();
+  _ip_form := null;
+  return ok;
+}
+
+// ============================================================================
+// MIDI Setup
+// ============================================================================
+// Ein Pfad und zwei Knoepfe. Mehr braucht es nicht: die Ausgabe ist ein roher
+// Bytestrom in eine Geraetedatei (/dev/midi1 und Verwandte). Zeigt der Pfad
+// auf eine gewoehnliche Datei, entsteht dort eine Mitschrift — die einzige
+// Art, die Ausgabe ohne MIDI-Hardware nachzupruefen.
+
+var _ms_form: TForm;
+var _ms_midi: TMidiOut;
+var _ms_edit: TEdit;
+var _ms_state: TLabel;
+
+fn MsShowState(): void {
+  if (_ms_state == null) { return; }
+  if (_ms_midi == null) { return; }
+  if (_ms_midi.IsOpen()) { _ms_state.Caption := "Status: offen"; }
+  else { _ms_state.Caption := "Status: geschlossen"; }
+  _ms_state.Invalidate();
+}
+
+fn MsOpen(sender: TControl): void {
+  if (_ms_midi == null) { return; }
+  if (_ms_edit == null) { return; }
+  var nb: TTextBuffer := new TTextBuffer();
+  nb.SetText(_ms_edit.GetText());
+  if (!_ms_midi.Open(nb.AsPChar())) {
+    if (_ms_state != null) {
+      _ms_state.Caption := "Status: Geraet nicht erreichbar";
+      _ms_state.Invalidate();
+    }
+    return;
+  }
+  MsShowState();
+}
+
+fn MsClose(sender: TControl): void {
+  if (_ms_midi == null) { return; }
+  _ms_midi.AllNotesOff();
+  _ms_midi.Close();
+  MsShowState();
+}
+
+fn MsDone(sender: TControl): void {
+  if (_ms_form != null) { _ms_form.ModalResult := mrOk; }
+}
+
+pub fn ShowMidiSetup(app: TApplication, midi: TMidiOut): void {
+  if (midi == null) { return; }
+
+  var f: TForm := NewForm(400, 180, "MIDI Setup");
+  f.Position := POS_MAIN_CENTER;
+  _ms_form := f;
+  _ms_midi := midi;
+
+  AddLabel(f as TControl, 12, 16, "Device:");
+  var path: pchar := "/dev/midi1";
+  if (midi.IsOpen()) { path := midi.Path; }
+  _ms_edit := AddEdit(f as TControl, 90, 14, 290, path);
+
+  _ms_state := AddLabel(f as TControl, 12, 52, "");
+  _ms_state.Width := 300;
+
+  var bOpen: TOmedButton := NewOmedButton("Open");
+  bOpen.Left := 12; bOpen.Top := 110; bOpen.Width := 80;
+  bOpen.OnClick := MsOpen;
+  f.AddChild(bOpen);
+
+  var bClose: TOmedButton := NewOmedButton("Close");
+  bClose.Left := 100; bClose.Top := 110; bClose.Width := 80;
+  bClose.OnClick := MsClose;
+  f.AddChild(bClose);
+
+  var bDone: TOmedButton := NewOmedButton("Done");
+  bDone.Left := 300; bDone.Top := 110; bDone.Width := 80;
+  bDone.OnClick := MsDone;
+  f.AddChild(bDone);
+
+  MsShowState();
+  app.ShowModal(f);
+
+  _ms_form := null;
+  _ms_midi := null;
+  _ms_edit := null;
+  _ms_state := null;
+}

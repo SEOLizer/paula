@@ -1,0 +1,202 @@
+// paula.theme — Amiga-Workbench-Anmutung fuer Paula.
+//
+// Absichtlich kein Dark-Mode-Gegenstueck: OctaMED sah auf jedem Amiga gleich
+// aus, und genau das ist hier der Punkt. Radius durchgaengig 0 — eine
+// abgerundete Ecke ist der schnellste Weg, die Illusion zu zerstoeren.
+//
+// Palette (Workbench 3.x):
+//   Grau   #AAAAAA   Flaechen
+//   Weiss  #FFFFFF   Lichtkante
+//   Dunkel #555555   Schattenkante
+//   Blau   #6688BB   Auswahl
+//   Schwarz #000000  Text
+
+theme "paula" extends "vega.light" {
+  version 1
+  mode light
+
+  form {
+    background: #AAAAAA
+    foreground: #000000
+    borderRadius: 0
+  }
+
+  panel {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #555555
+    borderWidth: 1
+    borderRadius: 0
+    paddingLeft: 2
+    paddingRight: 2
+    paddingTop: 2
+    paddingBottom: 2
+  }
+
+  label {
+    foreground: #000000
+    background: #AAAAAA
+  }
+
+  button {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #000000
+    borderWidth: 1
+    borderRadius: 0
+    paddingLeft: 6
+    paddingRight: 6
+    paddingTop: 1
+    paddingBottom: 1
+    preferredHeight: 18
+
+    hover {
+      background: #B4B4B4
+    }
+
+    pressed {
+      background: #999999
+      foreground: #FFFFFF
+    }
+  }
+
+  mainMenu {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #555555
+    borderRadius: 0
+    selectionBackground: #000000
+    selectionForeground: #FFFFFF
+
+    part item {
+      background: #AAAAAA
+      foreground: #000000
+      borderRadius: 0
+      paddingLeft: 8
+      paddingRight: 8
+    }
+  }
+
+  popupMenu {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #000000
+    borderWidth: 1
+    borderRadius: 0
+    selectionBackground: #000000
+    selectionForeground: #FFFFFF
+
+    part item {
+      background: #AAAAAA
+      foreground: #000000
+      borderRadius: 0
+    }
+
+    part separator {
+      foreground: #555555
+    }
+  }
+
+  listBox {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #555555
+    borderWidth: 1
+    borderRadius: 0
+    selectionBackground: #6688BB
+    selectionForeground: #FFFFFF
+
+    part item {
+      background: #AAAAAA
+      foreground: #000000
+      borderRadius: 0
+      paddingLeft: 2
+      paddingRight: 2
+    }
+  }
+
+  grid {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #555555
+    borderWidth: 1
+    borderRadius: 0
+    selectionBackground: #6688BB
+    selectionForeground: #FFFFFF
+
+    part header {
+      background: #999999
+      foreground: #000000
+      borderColor: #555555
+      borderRadius: 0
+    }
+  }
+
+  edit {
+    background: #FFFFFF
+    foreground: #000000
+    borderColor: #555555
+    borderWidth: 1
+    borderRadius: 0
+    selectionBackground: #6688BB
+    selectionForeground: #FFFFFF
+
+    // Der Fokus wird durch einen schwarzen Rahmen angezeigt, nicht durch die
+    // blaue Leuchtkante des Standardthemes: auf dem Amiga gab es keine
+    // Akzentfarbe, die ein Feld "aktiv" faerbt.
+    focused {
+      borderColor: #000000
+      borderWidth: 1
+    }
+  }
+
+  // Die Dateiauswahl zeigt ihre Eintraege in einer TListView, und die hat
+  // ihren eigenen Typ. Ohne diesen Eintrag bliebe genau diese eine Liste
+  // weiss, waehrend alle anderen im Amiga-Grau stehen.
+  listView {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #555555
+    borderWidth: 1
+    borderRadius: 0
+    selectionBackground: #6688BB
+    selectionForeground: #FFFFFF
+
+    part header {
+      background: #AAAAAA
+      foreground: #000000
+      borderColor: #555555
+      borderRadius: 0
+    }
+  }
+
+  // Vegas eigene Dialoge (Meldung, Rueckfrage, Dateiauswahl) haben einen
+  // eigenen Typ. Ohne diesen Eintrag stuenden sie als einzige Fenster im
+  // Standardtheme da.
+  dialog {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #000000
+    borderWidth: 1
+    borderRadius: 0
+  }
+
+  scrollBar {
+    background: #999999
+    borderRadius: 0
+    trackColor: #999999
+
+    part thumb {
+      background: #AAAAAA
+      borderColor: #000000
+      borderRadius: 0
+    }
+  }
+
+  statusBar {
+    background: #AAAAAA
+    foreground: #000000
+    borderColor: #555555
+    borderRadius: 0
+  }
+}

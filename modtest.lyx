@@ -1,0 +1,73 @@
+// modtest.lyx — Pruefprogramm fuer den MOD-Import.
+import std.io;
+import OMED.Song;
+import OMED.MOD;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintIntLn(v);
+}
+
+fn main(): int64 {
+  Show("periode 856 -> note", PeriodToNote(856));
+  Show("periode 428 -> note", PeriodToNote(428));
+  Show("periode 214 -> note", PeriodToNote(214));
+  Show("periode 113 -> note", PeriodToNote(113));
+
+  var song: TSong := LoadMOD("/home/andreas/PhpstormProjects/lyx-octaMED/alone.mod");
+  if (song == null) { PrintStrLn("NICHT GELADEN"); return 1; }
+
+  PrintStr("titel: "); PrintStrLn(song.Name);
+  Show("blocks", song.BlockCount);
+  Show("instrumente", song.InstrCount);
+  Show("sequenzlaenge", song.SeqLen());
+  Show("tracks in block 0", song.BlockAt(0).Tracks);
+  Show("lines in block 0", song.BlockAt(0).Lines);
+  Show("8-kanal-flag", song.EightChannel as int64);
+
+  // Wie viele Zellen tragen ueberhaupt Noten? Ein Modul, dessen Patterns leer
+  // ankommen, waere still, ohne dass es auffiele.
+  var noten: int64 := 0;
+  var mitInstr: int64 := 0;
+  var mitCmd: int64 := 0;
+  var bi: int64 := 0;
+  while (bi < song.BlockCount) {
+    var b: TBlock := song.BlockAt(bi);
+    var l: int64 := 0;
+    while (l < b.Lines) {
+      var t: int64 := 0;
+      while (t < b.Tracks) {
+        var c: int64 := b.Cell(l, t);
+        if (CellNote(c) > 0) { noten := noten + 1; }
+        if (CellInstr(c) > 0) { mitInstr := mitInstr + 1; }
+        if (CellCmd(c) > 0) { mitCmd := mitCmd + 1; }
+        t := t + 1;
+      }
+      l := l + 1;
+    }
+    bi := bi + 1;
+  }
+  Show("zellen mit note", noten);
+  Show("zellen mit instrument", mitInstr);
+  Show("zellen mit command", mitCmd);
+
+  var i: int64 := 1;
+  while (i <= 13) {
+    var ins: TInstrument := song.Instrument(i);
+    if (ins != null) {
+      if (ins.SampleLen > 0) {
+        PrintStr("  ");
+        PrintStr(ins.Name);
+        PrintStr("  len=");
+        PrintInt(ins.SampleLen);
+        PrintStr(" vol=");
+        PrintInt(ins.Volume);
+        PrintStr(" rep=");
+        PrintInt(ins.RepeatStart);
+        PrintStr("/");
+        PrintIntLn(ins.RepeatLen);
+      }
+    }
+    i := i + 1;
+  }
+  return 0;
+}

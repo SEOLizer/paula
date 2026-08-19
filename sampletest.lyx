@@ -1,0 +1,197 @@
+// sampletest.lyx — Pruefprogramm fuer Phase 4 ohne Oberflaeche.
+// Laedt ein 8SVX- und ein RAW-Sample, prueft Perioden und schreibt einen
+// gemischten Ton als rohes PCM auf die Standardausgabe-Datei.
+import std.io;
+import std.fs;
+import OMED.Song;
+import OMED.Sample;
+import OMED.Playback;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintIntLn(v);
+}
+
+fn main(): int64 {
+  var argIff: pchar := "/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/test.8svx";
+  var argRaw: pchar := "/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/test.raw";
+
+  var a: TInstrument := NewInstrument("Iff");
+  if (!Load8SVXSample(a, argIff)) { PrintStrLn("8SVX: FEHLER"); return 1; }
+  Show("8svx len", a.SampleLen);
+  Show("8svx rate", a.SampleRate);
+  Show("8svx repstart(words)", a.RepeatStart);
+  Show("8svx replen(words)", a.RepeatLen);
+  Show("8svx vol", a.Volume);
+
+  var b: TInstrument := NewInstrument("Raw");
+  if (!LoadRawSample(b, argRaw)) { PrintStrLn("RAW: FEHLER"); return 2; }
+  Show("raw len", b.SampleLen);
+  Show("raw rate", b.SampleRate);
+
+  Show("period C-1", NotePeriod(1, 0));
+  Show("period C-3", NotePeriod(25, 0));
+  Show("period A-3", NotePeriod(34, 0));
+  Show("period C-6", NotePeriod(61, 0));
+  Show("rate C-3", PeriodToRate(NotePeriod(25, 0)));
+
+  var mix: TSoftwareMixerBackend := NewSoftwareMixerBackend(8);
+  mix.Init(OM_MIX_RATE);
+  mix.NoteOn(0, a, NotePeriod(25, 0), 64);
+  Show("active", mix.ActiveVoices());
+
+  var frames: int64 := OM_MIX_RATE / 2;
+  var buf: int64 := alloc(frames * 4);
+  mix.RenderTick(buf, frames);
+
+  // Spitzenwert des linken Kanals: 0 hiesse, es wurde nichts gemischt.
+  var peak: int64 := 0;
+  var i: int64 := 0;
+  while (i < frames) {
+    var lo: int64 := peek8(buf + i * 4);
+    var hi: int64 := peek8(buf + i * 4 + 1);
+    var v: int64 := (hi << 8) | lo;
+    if (v > 32767) { v := v - 65536; }
+    if (v < 0) { v := -v; }
+    if (v > peak) { peak := v; }
+    i := i + 1;
+  }
+  Show("peak", peak);
+  Show("still active", mix.ActiveVoices());
+
+  // ---- Paula-Backend ------------------------------------------------------
+  var pa: TPaula4ChannelBackend := NewPaula4ChannelBackend();
+  pa.Init(OM_MIX_RATE);
+
+  // Frequenzgrenze: eine Periode unter 124 darf nicht durchschlagen.
+  pa.NoteOn(0, a, 60, 64);
+  var v0: TVoice := pa.Voice(0);
+  Show("paula step @period 60", v0.Step);
+  var vref: int64 := (PeriodToRate(OM_PAULA_MIN_PERIOD) << 16) / OM_MIX_RATE;
+  Show("paula step @period 124", vref);
+
+  // Panning: Kanal 0 links, Kanal 1 rechts, jeweils nur auf einer Seite.
+  pa.NoteOff(0);
+  pa.NoteOn(0, a, NotePeriod(25, 0), 64);
+  var pbuf: int64 := alloc(2000 * 4);
+  pa.RenderTick(pbuf, 2000);
+  var pl: int64 := 0;
+  var pr: int64 := 0;
+  var k: int64 := 0;
+  while (k < 2000) {
+    var lv: int64 := (peek8(pbuf + k * 4 + 1) << 8) | peek8(pbuf + k * 4);
+    var rv: int64 := (peek8(pbuf + k * 4 + 3) << 8) | peek8(pbuf + k * 4 + 2);
+    if (lv > 32767) { lv := lv - 65536; }
+    if (rv > 32767) { rv := rv - 65536; }
+    if (lv < 0) { lv := -lv; }
+    if (rv < 0) { rv := -rv; }
+    if (lv > pl) { pl := lv; }
+    if (rv > pr) { pr := rv; }
+    k := k + 1;
+  }
+  Show("paula ch0 peak left", pl);
+  Show("paula ch0 peak right", pr);
+
+  pa.NoteOff(0);
+  pa.NoteOn(1, a, NotePeriod(25, 0), 64);
+  pa.RenderTick(pbuf, 2000);
+  pl := 0;
+  pr := 0;
+  k := 0;
+  while (k < 2000) {
+    var lv2: int64 := (peek8(pbuf + k * 4 + 1) << 8) | peek8(pbuf + k * 4);
+    var rv2: int64 := (peek8(pbuf + k * 4 + 3) << 8) | peek8(pbuf + k * 4 + 2);
+    if (lv2 > 32767) { lv2 := lv2 - 65536; }
+    if (rv2 > 32767) { rv2 := rv2 - 65536; }
+    if (lv2 < 0) { lv2 := -lv2; }
+    if (rv2 < 0) { rv2 := -rv2; }
+    if (lv2 > pl) { pl := lv2; }
+    if (rv2 > pr) { pr := rv2; }
+    k := k + 1;
+  }
+  Show("paula ch1 peak left", pl);
+  Show("paula ch1 peak right", pr);
+
+  // 8-Bit-Aufloesung: bei kleiner Lautstaerke bleiben im Paula-Modus nur
+  // wenige Stufen uebrig, waehrend der Software-Mixer feiner aufloest.
+  pa.NoteOff(1);
+  pa.NoteOn(0, a, NotePeriod(25, 0), 2);
+  pa.RenderTick(pbuf, 2000);
+  var pq: int64 := 0;
+  var q: int64 := 0;
+  while (q < 2000) {
+    var qv: int64 := (peek8(pbuf + q * 4 + 1) << 8) | peek8(pbuf + q * 4);
+    if (qv > 32767) { qv := qv - 65536; }
+    if (qv < 0) { qv := -qv; }
+    if (qv > pq) { pq := qv; }
+    q := q + 1;
+  }
+  Show("paula peak @vol 2", pq);
+
+  var mx2: TSoftwareMixerBackend := NewSoftwareMixerBackend(4);
+  mx2.Init(OM_MIX_RATE);
+  mx2.NoteOn(0, a, NotePeriod(25, 0), 2);
+  mx2.RenderTick(pbuf, 2000);
+  var mq: int64 := 0;
+  q := 0;
+  while (q < 2000) {
+    var mv: int64 := (peek8(pbuf + q * 4 + 1) << 8) | peek8(pbuf + q * 4);
+    if (mv > 32767) { mv := mv - 65536; }
+    if (mv < 0) { mv := -mv; }
+    if (mv > mq) { mq := mv; }
+    q := q + 1;
+  }
+  Show("mixer peak @vol 2", mq);
+  pa.NoteOff(0);
+
+  // Vier Kanaele, nicht mehr: Kanal 4 landet wieder auf Kanal 0.
+  pa.NoteOn(2, a, NotePeriod(25, 0), 64);
+  pa.NoteOn(3, a, NotePeriod(25, 0), 64);
+  pa.NoteOn(4, a, NotePeriod(25, 0), 64);
+  Show("paula active", pa.ActiveVoices());
+
+  // ---- 8-Kanal-Modus ------------------------------------------------------
+  // Erwartung: eine Stimme allein klingt halb so laut wie im Paula-Modus
+  // (Halbierung vor dem Addieren), zwei Stimmen auf demselben Hardwarekanal
+  // kommen zusammen wieder auf denselben Pegel — mehr geht nicht, das ist
+  // die Grenze der acht Bit.
+  var oc: TOctaMed8ChannelBackend := NewOctaMed8ChannelBackend();
+  oc.Init(OM_MIX_RATE);
+  oc.NoteOn(0, a, NotePeriod(25, 0), 64);
+  oc.RenderTick(pbuf, 2000);
+  var o1: int64 := 0;
+  var z: int64 := 0;
+  while (z < 2000) {
+    var ov: int64 := (peek8(pbuf + z * 4 + 1) << 8) | peek8(pbuf + z * 4);
+    if (ov > 32767) { ov := ov - 65536; }
+    if (ov < 0) { ov := -ov; }
+    if (ov > o1) { o1 := ov; }
+    z := z + 1;
+  }
+  Show("8ch one voice peak left", o1);
+
+  // Stimme 4 liegt auf demselben Hardwarekanal wie Stimme 0 (0 und 4 links).
+  oc.NoteOn(4, a, NotePeriod(25, 0), 64);
+  Show("8ch active", oc.ActiveVoices());
+  oc.RenderTick(pbuf, 2000);
+  var o2: int64 := 0;
+  var o2r: int64 := 0;
+  z := 0;
+  while (z < 2000) {
+    var ov2: int64 := (peek8(pbuf + z * 4 + 1) << 8) | peek8(pbuf + z * 4);
+    var ov2r: int64 := (peek8(pbuf + z * 4 + 3) << 8) | peek8(pbuf + z * 4 + 2);
+    if (ov2 > 32767) { ov2 := ov2 - 65536; }
+    if (ov2r > 32767) { ov2r := ov2r - 65536; }
+    if (ov2 < 0) { ov2 := -ov2; }
+    if (ov2r < 0) { ov2r := -ov2r; }
+    if (ov2 > o2) { o2 := ov2; }
+    if (ov2r > o2r) { o2r := ov2r; }
+    z := z + 1;
+  }
+  Show("8ch two voices peak left", o2);
+  Show("8ch two voices peak right", o2r);
+
+  WriteFile("/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/tone.pcm", buf as pchar, frames * 4);
+  return 0;
+}

@@ -1,0 +1,53 @@
+// loadtest.lyx — wie lange braucht ein Tick wirklich? Gemessen am geladenen
+// Modul, nicht am schlanken Demo-Song: acht Stimmen mit langen Samples sind
+// etwas anderes als vier mit Rechteckschwingungen.
+import std.io;
+import std.time;
+import OMED.Song;
+import OMED.Playback;
+import OMED.Replay;
+import OMED.MOD;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label); PrintStr(" = "); PrintIntLn(v);
+}
+
+fn Messe(song: TSong, backend: TPlaybackBackend, name: pchar): void {
+  backend.Init(OM_MIX_RATE);
+  var e: TReplayEngine := NewReplayEngine();
+  e.Attach(song, backend);
+  e.PlaySong();
+
+  var frames: int64 := e.FramesPerTick(OM_MIX_RATE);
+  var buf: int64 := alloc(frames * 4);
+
+  var start: int64 := NowMs();
+  var n: int64 := 0;
+  while (n < 500) {
+    e.DoTick();
+    backend.RenderTick(buf, frames);
+    n := n + 1;
+  }
+  var dauer: int64 := NowMs() - start;
+
+  PrintStr(name);
+  PrintStr(": 500 ticks in ");
+  PrintInt(dauer);
+  PrintStr(" ms, gespielte zeit ");
+  PrintInt((500 * frames * 1000) / OM_MIX_RATE);
+  PrintStr(" ms -> auslastung ");
+  PrintInt((dauer * 100 * OM_MIX_RATE) / (500 * frames * 1000));
+  PrintStrLn(" %");
+  free(buf, frames * 4);
+}
+
+fn main(): int64 {
+  var song: TSong := LoadMOD("/home/andreas/PhpstormProjects/lyx-octaMED/alone.mod");
+  if (song == null) { PrintStrLn("MOD nicht ladbar"); return 1; }
+  Show("tracks", song.BlockAt(0).Tracks);
+
+  Messe(song, NewPaula4ChannelBackend() as TPlaybackBackend, "paula ");
+  Messe(song, NewOctaMed8ChannelBackend() as TPlaybackBackend, "8kanal");
+  Messe(song, NewSoftwareMixerBackend(8) as TPlaybackBackend, "mixer ");
+  return 0;
+}

@@ -1,0 +1,583 @@
+// OMED/Playback.lyx — Stimmen, Perioden und das erste Backend.
+//
+// Die Trennung ist Absicht und steht so in der Design-Spec: TPlaybackBackend
+// weiss, WIE geklungen wird (Paula-Grenzen, 8-Kanal-Mischung, moderner Mixer),
+// die Replay-Engine darueber weiss, WAS gespielt wird. Phase 4 braucht davon
+// nur den Software-Mixer und einen einzelnen Ton; Paula- und 8-Kanal-Backend
+// setzen in Phase 5/6 auf denselben Schnitt auf.
+//
+// Alles rechnet in Amiga-Perioden, nicht in Hertz. Eine Periode ist die Zahl
+// der Chipbus-Takte zwischen zwei Samplebytes — der Wert, den Paula bekommt.
+// Wer hier auf Hertz umstellt, verliert genau die Quantisierung, die den
+// Klang ausmacht.
+
+@description("OctaMED-Tracker - Stimmen, Perioden, Software-Mixer")
+@author("Andreas Roene")
+unit OMED.Playback;
+
+import Vega.Lists;
+import OMED.Song;
+
+// Chiptakt des PAL-Amiga. Samplerate = Takt / Periode.
+pub con OM_PAL_CLOCK: int64 := 3546895;
+pub con OM_MIX_RATE: int64 := 44100;
+pub con OM_MIX_CHANNELS: int64 := 8;
+
+// Periodentabelle, Oktave 1 (C-1..B-1), Finetune 0 — die Werte aus der
+// Amiga-Replayroutine. Hoehere Oktaven halbieren die Periode.
+fn BasePeriod(st: int64): int64 {
+  if (st == 0) { return 856; }
+  if (st == 1) { return 808; }
+  if (st == 2) { return 762; }
+  if (st == 3) { return 720; }
+  if (st == 4) { return 678; }
+  if (st == 5) { return 640; }
+  if (st == 6) { return 604; }
+  if (st == 7) { return 570; }
+  if (st == 8) { return 538; }
+  if (st == 9) { return 508; }
+  if (st == 10) { return 480; }
+  return 453;
+}
+
+// Periode einer Notennummer (1 = C-1). Finetune verschiebt in Achtel-
+// Halbtonschritten; die Naeherung ueber Promille reicht dafuer, weil die
+// Periode danach ohnehin ganzzahlig wird.
+pub fn NotePeriod(note: int64, finetune: int64): int64 {
+  if (note < 1) { return 0; }
+  var st: int64 := NoteSemitone(note);
+  var oct: int64 := NoteOctave(note);
+  var p: int64 := BasePeriod(st);
+  var i: int64 := 1;
+  while (i < oct) {
+    p := p / 2;
+    i := i + 1;
+  }
+  if (finetune != 0) {
+    // Ein Achtel-Halbton sind rund 0,72 Prozent Periodenaenderung.
+    p := p - ((p * finetune * 72) / 10000);
+  }
+  // Hier wird NICHT auf die Paula-Grenzen geschnitten: OctaMED kennt sechs
+  // Oktaven, und im Mixer-Modus sind die hohen auch hoerbar. Was die Hardware
+  // nicht mehr kann, faengt das jeweilige Backend ab (TPaula4ChannelBackend
+  // und TOctaMed8ChannelBackend bei Periode 124) — eine Grenze in der
+  // Notentabelle waere eine Grenze fuer ALLE Backends.
+  if (p < 27) { p := 27; }
+  if (p > 3576) { p := 3576; }
+  return p;
+}
+
+pub fn PeriodToRate(period: int64): int64 {
+  if (period < 1) { return 0; }
+  return OM_PAL_CLOCK / period;
+}
+
+// ---- Stimme ----------------------------------------------------------------
+// Position und Vorschub in 16.16-Fixpunkt: bei ganzzahliger Schrittweite waere
+// jede Note um bis zu einen Halbton verstimmt.
+pub type TVoice = class {
+  Data: int64;        // 8-Bit-Sampledaten, signed
+  Len: int64;
+  RepStart: int64;    // in Bytes
+  RepLen: int64;      // in Bytes, 0 = keine Schleife
+  Pos: int64;         // 16.16
+  Step: int64;        // 16.16
+  Vol: int64;         // 0..64
+  Pan: int64;         // -64 = links, 0 = Mitte, +64 = rechts
+  Active: bool;
+
+  fn Create(): void {
+    self.Data := 0;
+    self.Len := 0;
+    self.RepStart := 0;
+    self.RepLen := 0;
+    self.Pos := 0;
+    self.Step := 0;
+    self.Vol := 64;
+    self.Pan := 0;
+    self.Active := false;
+  }
+
+  // Ein Byte an der aktuellen Position, als Wert von -128..127.
+  fn Sample(): int64 {
+    var idx: int64 := self.Pos >> 16;
+    if (idx < 0) { return 0; }
+    if (idx >= self.Len) { return 0; }
+    var b: int64 := peek8(self.Data + idx);
+    if (b > 127) { b := b - 256; }
+    return b;
+  }
+
+  fn Advance(): void {
+    self.Pos := self.Pos + self.Step;
+    var idx: int64 := self.Pos >> 16;
+    if (self.RepLen > 0) {
+      var loopEnd: int64 := self.RepStart + self.RepLen;
+      if (idx >= loopEnd) {
+        // Nicht auf den Schleifenanfang setzen, sondern zurueckfalten: sonst
+        // wandert bei kurzen Schleifen die Phase mit jedem Durchlauf.
+        self.Pos := self.Pos - (self.RepLen << 16);
+      }
+      return;
+    }
+    if (idx >= self.Len) { self.Active := false; }
+  }
+}
+
+// ---- Backend ---------------------------------------------------------------
+// Abstrakt im Sinn von "die Vorgabe tut nichts Sinnvolles": Lyx kennt keine
+// abstrakten Methoden, also stehen hier leere Rueckfallebenen, die jedes
+// Backend ueberschreibt.
+pub type TPlaybackBackend = class {
+  Rate: int64;
+
+  fn Init(rate: int64): void {
+    self.Rate := rate;
+  }
+
+  virtual fn NoteOn(ch: int64, ins: TInstrument, period: int64, vol: int64): void { }
+  virtual fn NoteOff(ch: int64): void { }
+  virtual fn SetVolume(ch: int64, vol: int64): void { }
+  virtual fn SetPeriod(ch: int64, period: int64): void { }
+  // Schreibt frames Bilder als signed 16 Bit, stereo, ineinander verschraenkt.
+  virtual fn RenderTick(buf: int64, frames: int64): void { }
+  virtual fn ActiveVoices(): int64 { return 0; }
+}
+
+// ---- Software-Mixer --------------------------------------------------------
+// Das Backend ohne historische Grenzen: so viele Stimmen wie Kanaele, lineare
+// Mischung, keine Paula-Eigenheiten. Es ist bewusst das erste — damit in
+// Phase 5 hoerbar wird, was der Paula-Modus anders macht.
+pub type TSoftwareMixerBackend = class extends TPlaybackBackend {
+  Voices: TIntArray;   // Zeiger auf TVoice, ein Eintrag je Kanal
+  Count: int64;
+
+  fn Create(channels: int64): void {
+    var n: int64 := channels;
+    if (n < 1) { n := 1; }
+    if (n > 64) { n := 64; }
+    self.Count := n;
+    self.Rate := OM_MIX_RATE;
+    self.Voices := new TIntArray(n);
+    var i: int64 := 0;
+    while (i < n) {
+      var v: TVoice := new TVoice();
+      self.Voices.Put(i, v as int64);
+      i := i + 1;
+    }
+  }
+
+  fn Voice(ch: int64): TVoice {
+    if (ch < 0) { return null; }
+    if (ch >= self.Count) { return null; }
+    return self.Voices.Get(ch) as TVoice;
+  }
+
+  override fn NoteOn(ch: int64, ins: TInstrument, period: int64, vol: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    if (ins == null) { return; }
+    if (ins.SampleData == 0) { return; }
+    if (period < 1) { return; }
+
+    v.Data := ins.SampleData;
+    v.Len := ins.SampleLen;
+    // rep/replen stehen in Worten — die Paula zaehlt Schleifen in Worten,
+    // gemischt wird aber byteweise.
+    v.RepStart := ins.RepeatStart * 2;
+    v.RepLen := ins.RepeatLen * 2;
+    if (v.RepStart + v.RepLen > v.Len) { v.RepLen := 0; }
+    v.Pos := 0;
+    v.Vol := vol;
+    v.Active := true;
+    self.SetPeriod(ch, period);
+  }
+
+  override fn NoteOff(ch: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    v.Active := false;
+  }
+
+  override fn SetVolume(ch: int64, vol: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    var x: int64 := vol;
+    if (x < 0) { x := 0; }
+    if (x > 64) { x := 64; }
+    v.Vol := x;
+  }
+
+  override fn SetPeriod(ch: int64, period: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    var srcRate: int64 := PeriodToRate(period);
+    if (self.Rate < 1) { self.Rate := OM_MIX_RATE; }
+    v.Step := (srcRate << 16) / self.Rate;
+  }
+
+  override fn ActiveVoices(): int64 {
+    var n: int64 := 0;
+    var i: int64 := 0;
+    while (i < self.Count) {
+      var v: TVoice := self.Voice(i);
+      if (v != null) { if (v.Active) { n := n + 1; } }
+      i := i + 1;
+    }
+    return n;
+  }
+
+  override fn RenderTick(buf: int64, frames: int64): void {
+    var f: int64 := 0;
+    while (f < frames) {
+      var l: int64 := 0;
+      var r: int64 := 0;
+      var i: int64 := 0;
+      while (i < self.Count) {
+        var v: TVoice := self.Voice(i);
+        if (v != null) {
+          if (v.Active) {
+            // 8 Bit auf 16 Bit heben (<<7 statt <<8: der Mix mehrerer Stimmen
+            // soll nicht schon bei zwei Kanaelen anschlagen) und die
+            // Lautstaerke 0..64 anwenden.
+            var s: int64 := (v.Sample() * v.Vol * 128) / 64;
+            // Panning ohne Mittenverlust: in der Mitte steht die Stimme auf
+            // beiden Seiten voll, wie auf dem Amiga, wo ein Kanal fest auf
+            // einer Seite liegt und nicht heruntergemischt wird.
+            var pl: int64 := 64 - v.Pan;
+            var pr: int64 := 64 + v.Pan;
+            if (pl < 0) { pl := 0; }
+            if (pl > 64) { pl := 64; }
+            if (pr < 0) { pr := 0; }
+            if (pr > 64) { pr := 64; }
+            l := l + ((s * pl) / 64);
+            r := r + ((s * pr) / 64);
+            v.Advance();
+          }
+        }
+        i := i + 1;
+      }
+
+      // Harte Begrenzung statt Ueberlauf: ein Ueberlauf klaenge nicht nach
+      // Uebersteuerung, sondern nach Knacken.
+      if (l > 32767) { l := 32767; }
+      if (l < -32768) { l := -32768; }
+      if (r > 32767) { r := 32767; }
+      if (r < -32768) { r := -32768; }
+
+      var o: int64 := buf + (f * 4);
+      poke8(o, l & 0xFF);
+      poke8(o + 1, (l >> 8) & 0xFF);
+      poke8(o + 2, r & 0xFF);
+      poke8(o + 3, (r >> 8) & 0xFF);
+      f := f + 1;
+    }
+  }
+}
+
+pub fn NewSoftwareMixerBackend(channels: int64): TSoftwareMixerBackend {
+  return new TSoftwareMixerBackend(channels);
+}
+
+// ---- Paula, 4 Kanaele ------------------------------------------------------
+// Das historische Backend. Die Unterschiede zum Software-Mixer sind keine
+// Auslassungen, sondern der Klang:
+//
+//   * genau vier Stimmen — eine fuenfte Note nimmt einer bestehenden ihren
+//     Kanal weg, so wie auf dem Amiga;
+//   * harte Kanalzuordnung links/rechts (0 und 3 links, 1 und 2 rechts), kein
+//     Panning dazwischen. Paula hat keinen Panoramaregler;
+//   * die Lautstaerke wirkt VOR der 8-Bit-Aufloesung. Der Chip multipliziert
+//     ein 8-Bit-Sample mit einem 6-Bit-Volumen und gibt das Ergebnis wieder
+//     als 8 Bit aus — genau daher kommt das Rauschen leiser Stimmen, und
+//     genau das geht verloren, wenn man in 16 Bit rechnet;
+//   * die Periode wird bei 124 abgefangen. Darunter kommt der Chipbus mit dem
+//     DMA nicht mehr nach (rund 28,8 kHz) — der Grund, warum hohe Noten auf
+//     dem Amiga irgendwann nicht mehr hoeher werden.
+pub con OM_PAULA_MIN_PERIOD: int64 := 124;
+pub con OM_PAULA_MAX_PERIOD: int64 := 3576;
+
+// Kanal 0 und 3 liegen links, 1 und 2 rechts. Diese Verteilung ist der Grund,
+// warum Amiga-Musik im Kopfhoerer so breit klingt.
+pub fn PaulaChannelLeft(ch: int64): bool {
+  var c: int64 := ch % 4;
+  if (c == 0) { return true; }
+  if (c == 3) { return true; }
+  return false;
+}
+
+pub type TPaula4ChannelBackend = class extends TPlaybackBackend {
+  Voices: TIntArray;
+  Count: int64;
+
+  fn Create(): void {
+    self.Count := 4;
+    self.Rate := OM_MIX_RATE;
+    self.Voices := new TIntArray(4);
+    var i: int64 := 0;
+    while (i < 4) {
+      var v: TVoice := new TVoice();
+      // Das Panning steht fest und wird nie gesetzt: es ist Hardware.
+      if (PaulaChannelLeft(i)) { v.Pan := -64; }
+      else { v.Pan := 64; }
+      self.Voices.Put(i, v as int64);
+      i := i + 1;
+    }
+  }
+
+  fn Voice(ch: int64): TVoice {
+    if (ch < 0) { return null; }
+    return self.Voices.Get(ch % 4) as TVoice;
+  }
+
+  override fn NoteOn(ch: int64, ins: TInstrument, period: int64, vol: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    if (ins == null) { return; }
+    if (ins.SampleData == 0) { return; }
+
+    v.Data := ins.SampleData;
+    v.Len := ins.SampleLen;
+    v.RepStart := ins.RepeatStart * 2;
+    v.RepLen := ins.RepeatLen * 2;
+    if (v.RepStart + v.RepLen > v.Len) { v.RepLen := 0; }
+    v.Pos := 0;
+    self.SetVolume(ch, vol);
+    v.Active := true;
+    self.SetPeriod(ch, period);
+  }
+
+  override fn NoteOff(ch: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    v.Active := false;
+  }
+
+  override fn SetVolume(ch: int64, vol: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    var x: int64 := vol;
+    if (x < 0) { x := 0; }
+    if (x > 64) { x := 64; }
+    v.Vol := x;
+  }
+
+  override fn SetPeriod(ch: int64, period: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    var p: int64 := period;
+    if (p < OM_PAULA_MIN_PERIOD) { p := OM_PAULA_MIN_PERIOD; }
+    if (p > OM_PAULA_MAX_PERIOD) { p := OM_PAULA_MAX_PERIOD; }
+    if (self.Rate < 1) { self.Rate := OM_MIX_RATE; }
+    v.Step := (PeriodToRate(p) << 16) / self.Rate;
+  }
+
+  override fn ActiveVoices(): int64 {
+    var n: int64 := 0;
+    var i: int64 := 0;
+    while (i < 4) {
+      var v: TVoice := self.Voice(i);
+      if (v != null) { if (v.Active) { n := n + 1; } }
+      i := i + 1;
+    }
+    return n;
+  }
+
+  override fn RenderTick(buf: int64, frames: int64): void {
+    var f: int64 := 0;
+    while (f < frames) {
+      var l: int64 := 0;
+      var r: int64 := 0;
+      var i: int64 := 0;
+      while (i < 4) {
+        var v: TVoice := self.Voice(i);
+        if (v != null) {
+          if (v.Active) {
+            // Erst multiplizieren, dann auf 8 Bit zurueckschneiden: das ist
+            // die Stelle, an der Paula Aufloesung verliert. Wer die Division
+            // nach dem Hochskalieren macht, bekommt einen sauberen Klang —
+            // und damit den falschen.
+            var s8: int64 := (v.Sample() * v.Vol) / 64;
+            if (s8 > 127) { s8 := 127; }
+            if (s8 < -128) { s8 := -128; }
+            var s: int64 := s8 * 128;
+            if (PaulaChannelLeft(i)) { l := l + s; }
+            else { r := r + s; }
+            v.Advance();
+          }
+        }
+        i := i + 1;
+      }
+
+      if (l > 32767) { l := 32767; }
+      if (l < -32768) { l := -32768; }
+      if (r > 32767) { r := 32767; }
+      if (r < -32768) { r := -32768; }
+
+      var o: int64 := buf + (f * 4);
+      poke8(o, l & 0xFF);
+      poke8(o + 1, (l >> 8) & 0xFF);
+      poke8(o + 2, r & 0xFF);
+      poke8(o + 3, (r >> 8) & 0xFF);
+      f := f + 1;
+    }
+  }
+}
+
+pub fn NewPaula4ChannelBackend(): TPaula4ChannelBackend {
+  return new TPaula4ChannelBackend();
+}
+
+// ---- OctaMED, 8 Kanaele ----------------------------------------------------
+// Der Modus, der dem Programm seinen Namen gab. Die Amiga-Hardware hat vier
+// Kanaele; acht Stimmen entstehen, indem OctaMED je zwei davon in Software
+// zusammenmischt und das Ergebnis als EINEN 8-Bit-Strom an Paula gibt.
+//
+// Daraus folgt der bekannte Klang, und zwar zwangslaeufig:
+//
+//   * Zwei Stimmen teilen sich acht Bit. Vor dem Addieren muss halbiert
+//     werden, sonst laeuft die Summe ueber — der Dynamikbereich je Stimme
+//     schrumpft also auf die Haelfte. Das ist der Grund, warum der 8-Kanal-
+//     Modus leiser und rauer klingt als der 4-Kanal-Modus, und kein Fehler,
+//     den man "wegnormalisieren" darf.
+//   * Die Lautstaerke wirkt weiterhin vor der Aufloesung — zwei Verluste
+//     hintereinander, erst das 6-Bit-Volume, dann die Halbierung.
+//   * Das Stereobild bleibt das der Hardware: Stimme n liegt auf dem
+//     Hardwarekanal n % 4, also 0 und 4 links, 1 und 5 rechts, 2 und 6
+//     rechts, 3 und 7 links.
+//
+// Entspricht FLAG_8CHANNEL (0x40) im Songheader.
+pub con OM_8CH_VOICES: int64 := 8;
+
+pub type TOctaMed8ChannelBackend = class extends TPlaybackBackend {
+  Voices: TIntArray;
+  Count: int64;
+
+  fn Create(): void {
+    self.Count := OM_8CH_VOICES;
+    self.Rate := OM_MIX_RATE;
+    self.Voices := new TIntArray(OM_8CH_VOICES);
+    var i: int64 := 0;
+    while (i < OM_8CH_VOICES) {
+      var v: TVoice := new TVoice();
+      if (PaulaChannelLeft(i)) { v.Pan := -64; }
+      else { v.Pan := 64; }
+      self.Voices.Put(i, v as int64);
+      i := i + 1;
+    }
+  }
+
+  fn Voice(ch: int64): TVoice {
+    if (ch < 0) { return null; }
+    return self.Voices.Get(ch % OM_8CH_VOICES) as TVoice;
+  }
+
+  override fn NoteOn(ch: int64, ins: TInstrument, period: int64, vol: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    if (ins == null) { return; }
+    if (ins.SampleData == 0) { return; }
+
+    v.Data := ins.SampleData;
+    v.Len := ins.SampleLen;
+    v.RepStart := ins.RepeatStart * 2;
+    v.RepLen := ins.RepeatLen * 2;
+    if (v.RepStart + v.RepLen > v.Len) { v.RepLen := 0; }
+    v.Pos := 0;
+    self.SetVolume(ch, vol);
+    v.Active := true;
+    self.SetPeriod(ch, period);
+  }
+
+  override fn NoteOff(ch: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    v.Active := false;
+  }
+
+  override fn SetVolume(ch: int64, vol: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    var x: int64 := vol;
+    if (x < 0) { x := 0; }
+    if (x > 64) { x := 64; }
+    v.Vol := x;
+  }
+
+  // Die Periodengrenzen gelten weiter: gemischt wird zwar in Software, die
+  // Sampledaten kommen aber aus derselben Quelle wie im 4-Kanal-Modus.
+  override fn SetPeriod(ch: int64, period: int64): void {
+    var v: TVoice := self.Voice(ch);
+    if (v == null) { return; }
+    var p: int64 := period;
+    if (p < OM_PAULA_MIN_PERIOD) { p := OM_PAULA_MIN_PERIOD; }
+    if (p > OM_PAULA_MAX_PERIOD) { p := OM_PAULA_MAX_PERIOD; }
+    if (self.Rate < 1) { self.Rate := OM_MIX_RATE; }
+    v.Step := (PeriodToRate(p) << 16) / self.Rate;
+  }
+
+  override fn ActiveVoices(): int64 {
+    var n: int64 := 0;
+    var i: int64 := 0;
+    while (i < OM_8CH_VOICES) {
+      var v: TVoice := self.Voice(i);
+      if (v != null) { if (v.Active) { n := n + 1; } }
+      i := i + 1;
+    }
+    return n;
+  }
+
+  override fn RenderTick(buf: int64, frames: int64): void {
+    var f: int64 := 0;
+    while (f < frames) {
+      var l: int64 := 0;
+      var r: int64 := 0;
+
+      // Vier Hardwarekanaele, je zwei Stimmen: erst die Software-Mischung im
+      // 8-Bit-Raum, dann erst der Weg nach draussen.
+      var hw: int64 := 0;
+      while (hw < 4) {
+        var acc: int64 := 0;
+        var k: int64 := 0;
+        while (k < 2) {
+          var v: TVoice := self.Voice(hw + (k * 4));
+          if (v != null) {
+            if (v.Active) {
+              var s8: int64 := (v.Sample() * v.Vol) / 64;
+              if (s8 > 127) { s8 := 127; }
+              if (s8 < -128) { s8 := -128; }
+              // Halbieren VOR dem Addieren: so macht es OctaMED, und so
+              // entsteht die halbe Dynamik je Stimme.
+              acc := acc + (s8 / 2);
+              v.Advance();
+            }
+          }
+          k := k + 1;
+        }
+        if (acc > 127) { acc := 127; }
+        if (acc < -128) { acc := -128; }
+
+        var s: int64 := acc * 128;
+        if (PaulaChannelLeft(hw)) { l := l + s; }
+        else { r := r + s; }
+        hw := hw + 1;
+      }
+
+      if (l > 32767) { l := 32767; }
+      if (l < -32768) { l := -32768; }
+      if (r > 32767) { r := 32767; }
+      if (r < -32768) { r := -32768; }
+
+      var o: int64 := buf + (f * 4);
+      poke8(o, l & 0xFF);
+      poke8(o + 1, (l >> 8) & 0xFF);
+      poke8(o + 2, r & 0xFF);
+      poke8(o + 3, (r >> 8) & 0xFF);
+      f := f + 1;
+    }
+  }
+}
+
+pub fn NewOctaMed8ChannelBackend(): TOctaMed8ChannelBackend {
+  return new TOctaMed8ChannelBackend();
+}

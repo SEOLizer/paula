@@ -1,0 +1,164 @@
+// OMED/Midi.lyx — MIDI-Ausgabe.
+//
+// OctaMED war nie ein reiner Sampletracker: ein Instrument mit gesetztem
+// midich spielt nicht auf Paula, sondern auf einem MIDI-Geraet, und derselbe
+// Block treibt beides gleichzeitig. Genau das macht diese Unit moeglich.
+//
+// Geschrieben werden rohe MIDI-Bytes in eine Geraetedatei (/dev/midi1 und
+// Verwandte). Kein Sequencer, kein Zeitstempel: die Replay-Engine hat ihren
+// Takt schon, und ein zweiter waere ein zweiter Fehler.
+//
+// Ein Pfad, der sich nicht oeffnen laesst, schaltet die Ausgabe still ab —
+// ohne MIDI-Geraet soll der Tracker weiterlaufen und nicht stehenbleiben.
+// Zeigt der Pfad auf eine gewoehnliche Datei, landet der Bytestrom dort; das
+// ist die einzige Art, die Ausgabe ohne Hardware nachzupruefen.
+
+@description("OctaMED-Tracker - MIDI-Ausgabe")
+@author("Andreas Roene")
+unit OMED.Midi;
+
+import std.fs;
+
+// Statusbytes. Die untere Haelfte ist der Kanal (0..15), oben steht, worum es
+// geht — deshalb sind es Vielfache von 16.
+pub con MIDI_NOTE_OFF: int64 := 0x80;
+pub con MIDI_NOTE_ON: int64 := 0x90;
+pub con MIDI_POLY_AFTERTOUCH: int64 := 0xA0;
+pub con MIDI_CONTROL_CHANGE: int64 := 0xB0;
+pub con MIDI_PROGRAM_CHANGE: int64 := 0xC0;
+pub con MIDI_CHANNEL_AFTERTOUCH: int64 := 0xD0;
+pub con MIDI_PITCH_BEND: int64 := 0xE0;
+
+// Controllernummern, die OctaMED-Commands direkt ansprechen.
+pub con MIDI_CC_MODULATION: int64 := 1;
+pub con MIDI_CC_PAN: int64 := 10;
+
+// OctaMED zaehlt Noten ab C-1 = 1, MIDI zaehlt C-1 = 24 bzw. das mittlere C
+// als 60. C-3 ist bei uns 25 und soll auf 60 liegen — also plus 35.
+pub con MIDI_NOTE_OFFSET: int64 := 35;
+
+pub fn MidiNoteOf(note: int64): int64 {
+  var n: int64 := note + MIDI_NOTE_OFFSET;
+  if (n < 0) { return 0; }
+  if (n > 127) { return 127; }
+  return n;
+}
+
+// Volume 0..64 (OctaMED) auf Velocity 0..127.
+pub fn MidiVelocityOf(vol: int64): int64 {
+  var v: int64 := (vol * 127) / 64;
+  if (v < 0) { return 0; }
+  if (v > 127) { return 127; }
+  return v;
+}
+
+pub type TMidiOut = class {
+  Fd: int64;
+  Open_: bool;
+  Path: pchar;
+
+  fn Create(): void {
+    self.Fd := -1;
+    self.Open_ := false;
+    self.Path := "";
+  }
+
+  fn IsOpen(): bool { return self.Open_; }
+
+  // O_CREAT ist Absicht: zeigt der Pfad auf eine Geraetedatei, aendert es
+  // nichts; zeigt er auf eine noch nicht vorhandene Datei, entsteht die
+  // Mitschrift, mit der sich die Ausgabe pruefen laesst.
+  fn Open(path: pchar): bool {
+    self.Close();
+    if (path == 0) { return false; }
+    var f: int64 := open(path, O_WRONLY | O_CREAT | O_TRUNC, 420);
+    if (f < 0) { return false; }
+    self.Fd := f;
+    self.Open_ := true;
+    self.Path := path;
+    return true;
+  }
+
+  fn Close(): void {
+    if (!self.Open_) { return; }
+    close(self.Fd);
+    self.Fd := -1;
+    self.Open_ := false;
+  }
+
+  fn Raw(buf: int64, len: int64): void {
+    if (!self.Open_) { return; }
+    if (len < 1) { return; }
+    write(self.Fd, buf as pchar, len);
+  }
+
+  fn Send2(status: int64, d1: int64): void {
+    if (!self.Open_) { return; }
+    var b: int64 := alloc(2);
+    poke8(b, status & 0xFF);
+    poke8(b + 1, d1 & 0x7F);
+    self.Raw(b, 2);
+    free(b, 2);
+  }
+
+  fn Send3(status: int64, d1: int64, d2: int64): void {
+    if (!self.Open_) { return; }
+    var b: int64 := alloc(3);
+    poke8(b, status & 0xFF);
+    poke8(b + 1, d1 & 0x7F);
+    poke8(b + 2, d2 & 0x7F);
+    self.Raw(b, 3);
+    free(b, 3);
+  }
+
+  fn NoteOn(ch: int64, note: int64, vel: int64): void {
+    self.Send3(MIDI_NOTE_ON | (ch & 0x0F), note, vel);
+  }
+
+  // Note Off mit Velocity 0 statt eines eigenen Statusbytes waere kuerzer,
+  // aber ein echtes 8x ist das, was Geraete erwarten und was in einer
+  // Mitschrift lesbar bleibt.
+  fn NoteOff(ch: int64, note: int64): void {
+    self.Send3(MIDI_NOTE_OFF | (ch & 0x0F), note, 0);
+  }
+
+  fn ProgramChange(ch: int64, preset: int64): void {
+    self.Send2(MIDI_PROGRAM_CHANGE | (ch & 0x0F), preset);
+  }
+
+  fn ControlChange(ch: int64, cc: int64, value: int64): void {
+    self.Send3(MIDI_CONTROL_CHANGE | (ch & 0x0F), cc, value);
+  }
+
+  fn ChannelAftertouch(ch: int64, value: int64): void {
+    self.Send2(MIDI_CHANNEL_AFTERTOUCH | (ch & 0x0F), value);
+  }
+
+  fn PolyAftertouch(ch: int64, note: int64, value: int64): void {
+    self.Send3(MIDI_POLY_AFTERTOUCH | (ch & 0x0F), note, value);
+  }
+
+  // Pitchbend ist 14 Bit, verteilt auf zwei 7-Bit-Bytes; 8192 ist die Mitte.
+  fn PitchBend(ch: int64, value: int64): void {
+    var v: int64 := value;
+    if (v < 0) { v := 0; }
+    if (v > 16383) { v := 16383; }
+    self.Send3(MIDI_PITCH_BEND | (ch & 0x0F), v & 0x7F, (v >> 7) & 0x7F);
+  }
+
+  // Alle Noten aller Kanaele beenden. Beim Stoppen unverzichtbar: ein
+  // MIDI-Geraet haelt eine Note, bis jemand sie abstellt — auch dann, wenn
+  // der Tracker laengst steht.
+  fn AllNotesOff(): void {
+    if (!self.Open_) { return; }
+    var ch: int64 := 0;
+    while (ch < 16) {
+      self.ControlChange(ch, 123, 0);
+      ch := ch + 1;
+    }
+  }
+}
+
+pub fn NewMidiOut(): TMidiOut {
+  return new TMidiOut();
+}

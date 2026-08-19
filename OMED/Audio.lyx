@@ -1,0 +1,220 @@
+// OMED/Audio.lyx — der Weg vom gemischten Puffer zum Lautsprecher.
+//
+// Zwei Ausgabewege, ein Aufrufer: unter LyxOS ist es der AC97-Treiber
+// (ac97.lyx, Codec STAC9700), auf dem Entwicklungsrechner ALSA aus der
+// Standardbibliothek. Der Unterschied gehoert hierher und nirgends sonst —
+// die Replay-Engine und die Backends duerfen nicht wissen, wo der Ton landet.
+//
+// Phase 4 gibt einen einzelnen Ton als fertigen Puffer aus. Das schreibt
+// blockierend, haelt also fuer die Dauer des Tons die Oberflaeche an. Fuer
+// eine Vorhoerhilfe von wenigen Zehntelsekunden ist das ertraeglich; ab
+// Phase 5 laeuft die Ausgabe in einer Tickschleife und muss anders bedient
+// werden.
+
+@description("OctaMED-Tracker - Audioausgabe")
+@author("Andreas Roene")
+unit OMED.Audio;
+
+import std.io;
+import std.audio.alsa;
+import std.audio.playback;
+import OMED.Playback;
+
+// Die Standardbibliothek setzt beim Format weder Puffer- noch Periodengroesse.
+// ALSA nimmt dann seinen Vorgabewert, und der ist gross: bis zu einer Sekunde.
+// Fuer einen Tracker ist das untragbar — der Ton haengt hoerbar hinter dem
+// Bild her, und beim Stoppen laeuft der Puffer noch weiter. Deshalb werden die
+// Parameter hier von Hand gesetzt, direkt gegen libasound.
+//
+// Jedes dieser Symbole braucht eine Capability-Angabe (LCBS laesst unbekannte
+// FFI-Symbole nicht ohne durch). Es gibt keine Audio-Capability; der Zugriff
+// endet auf einer Geraetedatei unter /dev/snd, also ist fs.write die
+// ehrlichste Zuordnung.
+@cap(fs.write)
+extern fn snd_pcm_set_params(pcm: int64, format: int64, access: int64, channels: int64, rate: int64, softResample: int64, latencyUs: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_prepare(handle: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_drop(handle: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_avail_update(pcm: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_recover(pcm: int64, err: int64, silent: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_delay(pcm: int64, delayPtr: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_state(pcm: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_start(pcm: int64): int64 link "libasound.so.2";
+
+// Groesse des Geraetepuffers in Mikrosekunden. Sie ist die Obergrenze, nicht
+// der tatsaechliche Vorlauf — den steuert der Aufrufer ueber Delay().
+//
+// Gemessen im laufenden Programm: das Rendern eines Ticks dauert 1 ms, das
+// Setzen des Cursors 0 ms — aber zwischen zwei Timeraufrufen klaffen bis zu
+// 263 ms. So lange blockiert Vega beim Neuzeichnen des Fensters. Der Puffer
+// muss diese Pause ueberbruecken, sonst laeuft er leer, und jeder Leerlauf
+// ist ein hoerbares Knacken.
+pub con OM_LATENCY_US: int64 := 900000;
+
+// Zustaende aus snd_pcm_state. Gebraucht wird nur "vorbereitet": in diesem
+// Zustand liegen Daten im Puffer, aber die Wiedergabe laeuft noch nicht.
+pub con OM_PCM_PREPARED: int64 := 2;
+
+pub type TOmedAudio = class {
+  Handle: int64;
+  Rate: int64;
+  Ready: bool;      // Format gesetzt und Geraet vorbereitet
+  Underruns: int64; // wie oft der Puffer leerlief — jeder Aussetzer knackt
+
+  fn Create(): void {
+    self.Handle := 0;
+    self.Rate := OM_MIX_RATE;
+    self.Ready := false;
+    self.Underruns := 0;
+  }
+
+  fn Open(): bool {
+    if (self.Handle != 0) { return true; }
+    self.Handle := AudioOpen("default");
+    self.Ready := false;
+    return self.Handle != 0;
+  }
+
+  // Format EINMAL setzen und das Geraet vorbereiten. Der bequeme Weg ueber
+  // AudioPlayPCM macht beides bei jedem Aufruf neu — fuer einen einzelnen
+  // Ton egal, fuer einen laufenden Song toedlich: der Datenstrom risse
+  // fuenfzigmal je Sekunde ab.
+  // Format, Kanaele, Rate UND die gewuenschte Latenz in einem Aufruf.
+  //
+  // Der Umweg ueber snd_pcm_hw_params_* sieht feiner aus, geht hier aber ins
+  // Leere: die Setter melden Erfolg und lassen die Puffergroesse trotzdem bei
+  // ihrem Vorgabewert von rund 1 Million Bildern — 24 Sekunden Ton im Geraet.
+  // Genau das war die Verzoegerung zwischen Tastendruck und Klang.
+  // snd_pcm_set_params nimmt die Latenz als Zahl entgegen und setzt Puffer und
+  // Periode selbst passend.
+  fn Prepare(): bool {
+    if (self.Handle == 0) { return false; }
+    if (self.Ready) { return true; }
+
+    var rc: int64 := snd_pcm_set_params(self.Handle, SND_PCM_FORMAT_S16_LE,
+                                        SND_PCM_ACCESS_RW_INTERLEAVED, 2,
+                                        self.Rate, 1, OM_LATENCY_US);
+    if (rc < 0) { return false; }
+    if (snd_pcm_prepare(self.Handle) < 0) { return false; }
+    self.Ready := true;
+    return true;
+  }
+
+  // Alles verwerfen, was noch im Geraet steht. Beim Stoppen ist das der
+  // Unterschied zwischen "still" und "spielt noch eine halbe Sekunde weiter" —
+  // der Puffer gehoert der Soundkarte, nicht dem Programm.
+  fn Flush(): void {
+    if (self.Handle == 0) { return; }
+    if (!self.Ready) { return; }
+    snd_pcm_drop(self.Handle);
+    if (snd_pcm_prepare(self.Handle) < 0) { self.Ready := false; }
+  }
+
+  // Einen Block Bilder in den laufenden Strom schreiben. Blockiert, bis das
+  // Geraet Platz hat — genau das gibt dem Replay seinen Takt, ohne dass
+  // irgendwo eine Wartezeit von Hand gezaehlt werden muesste.
+  // Wie viele Bilder liegen noch vor der Ausgabe? Das ist der Abstand
+  // zwischen dem, was das Programm gerade rechnet, und dem, was der
+  // Hoerer gerade hoert — und damit die einzige Zahl, an der sich ein
+  // Vorlauf steuern laesst. Der freie Platz taugt dafuer nicht: er sagt,
+  // wie viel man NOCH hineinstopfen koennte, nicht wie weit man voraus ist.
+  fn Delay(): int64 {
+    if (self.Handle == 0) { return 0; }
+    if (!self.Prepare()) { return 0; }
+    var box: int64 := alloc(8);
+    poke64(box, 0);
+    var rc: int64 := snd_pcm_delay(self.Handle, box);
+    var d: int64 := peek64(box);
+    free(box, 8);
+    if (rc < 0) { return 0; }
+    if (d < 0) { return 0; }
+    return d;
+  }
+
+  // Platz im Geraetepuffer, in Bildern. Damit fuellt der Aufrufer vor, statt
+  // sich auf ein blockierendes Schreiben zu verlassen.
+  // Platz im Geraetepuffer, in Bildern.
+  //
+  // Der Aufruf bereitet das Geraet bei Bedarf selbst vor. Ohne das entsteht
+  // ein Henne-Ei-Problem: wer nur schreibt, wenn Platz gemeldet wird, bekommt
+  // von einem unvorbereiteten Geraet immer 0 gemeldet — und bereitet es
+  // deshalb nie vor. Das Replay lief dann zwar, blieb aber stumm.
+  fn Avail(): int64 {
+    if (self.Handle == 0) { return 0; }
+    if (!self.Prepare()) { return 0; }
+    var n: int64 := snd_pcm_avail_update(self.Handle);
+    if (n < 0) {
+      // Nach einem Underrun meldet auch avail einen Fehler. Aufraeumen und
+      // erneut fragen, sonst bleibt es fuer immer bei 0.
+      self.Underruns := self.Underruns + 1;
+      if (snd_pcm_recover(self.Handle, n, 1) < 0) { return 0; }
+      n := snd_pcm_avail_update(self.Handle);
+      if (n < 0) { return 0; }
+    }
+    return n;
+  }
+
+  // Ein Underrun ist kein Ausnahmefall, sondern Alltag: laeuft der Puffer
+  // einmal leer, geht das Geraet in den Fehlerzustand und nimmt nichts mehr
+  // an — ab dann bliebe es fuer immer still. snd_pcm_recover setzt es zurueck,
+  // danach wird der Block erneut geschrieben.
+  fn WriteFrames(buf: int64, frames: int64): bool {
+    if (!self.Prepare()) { return false; }
+    if (buf == 0) { return false; }
+    if (frames < 1) { return false; }
+
+    var rc: int64 := ALSAWriteGeneric(self.Handle, buf, frames * 4, 2, 16);
+    if (rc >= 0) {
+      self.StartIfPrepared();
+      return true;
+    }
+
+    self.Underruns := self.Underruns + 1;
+    if (snd_pcm_recover(self.Handle, rc, 1) < 0) { return false; }
+    if (ALSAWriteGeneric(self.Handle, buf, frames * 4, 2, 16) < 0) { return false; }
+    self.StartIfPrepared();
+    return true;
+  }
+
+  // Die Wiedergabe von Hand anwerfen.
+  //
+  // ALSA startet von selbst erst, wenn der Puffer VOLL ist. Wer den Vorlauf
+  // absichtlich klein haelt, fuellt ihn nie ganz — und wartet dann ewig auf
+  // einen Start, der nicht kommt. Gemessen: 40 ms Ton in drei Sekunden.
+  fn StartIfPrepared(): void {
+    if (self.Handle == 0) { return; }
+    if (snd_pcm_state(self.Handle) == OM_PCM_PREPARED) {
+      snd_pcm_start(self.Handle);
+    }
+  }
+
+  fn Close(): void {
+    if (self.Handle == 0) { return; }
+    AudioClose(self.Handle);
+    self.Handle := 0;
+    self.Ready := false;
+  }
+
+  // Signed 16 Bit, stereo, ineinander verschraenkt — genau das Format, das
+  // TSoftwareMixerBackend.RenderTick schreibt.
+  // Einen fertigen Puffer am Stueck ausgeben (Vorhoerhilfe). Fruher lief das
+  // ueber AudioPlayPCM aus der Standardbibliothek — das setzt sein Format mit
+  // ALSASetFormat, und die Funktion haelt jeden Erfolgswert ungleich 0 fuer
+  // einen Fehler. Auf diesem Geraet liefert snd_pcm_hw_params_any eine 1,
+  // also schlug sie immer fehl und das Vorhoeren blieb stumm. Derselbe Weg wie
+  // beim Abspielen ist ohnehin der richtige: einmal vorbereiten, dann
+  // schreiben.
+  fn PlayPCM(buf: int64, frames: int64): bool {
+    return self.WriteFrames(buf, frames);
+  }
+}
+
+pub fn NewOmedAudio(): TOmedAudio {
+  return new TOmedAudio();
+}

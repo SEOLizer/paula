@@ -1,0 +1,149 @@
+// mmdtest.lyx — Pruefprogramm fuer den MMD-Import (Phase 10). Liest je eine
+// erzeugte MMD0-, MMD1- und MMD2-Datei und vergleicht, was ankommt.
+import std.io;
+import OMED.Song;
+import OMED.MMD;
+
+con DIR: pchar := "/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/";
+
+fn Check(label: pchar, got: int64, want: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintInt(got);
+  if (got == want) { PrintStrLn("  OK"); }
+  else {
+    PrintStr("  ERWARTET ");
+    PrintIntLn(want);
+  }
+}
+
+fn CheckSong(label: pchar, s: TSong): void {
+  PrintStr("--- ");
+  PrintStrLn(label);
+  if (s == null) { PrintStrLn("  NICHT GELADEN"); return; }
+
+  PrintStr("  songname: ");
+  PrintStrLn(s.Name);
+  Check("  blocks", s.BlockCount, 2);
+  Check("  instrumente", s.InstrCount, 2);
+  Check("  tempo", s.Tempo, 100);
+  Check("  tpl", s.Tpl, 5);
+  Check("  lpb", s.Lpb, 8);
+  Check("  bpm-modus", s.BpmMode as int64, 1);
+  Check("  hex-volumes", s.HexVolumes as int64, 1);
+  Check("  8 kanaele", s.EightChannel as int64, 1);
+  Check("  mastervol", s.MasterVolume, 60);
+
+  var b: TBlock := s.BlockAt(0);
+  Check("  tracks", b.Tracks, 4);
+  Check("  lines", b.Lines, 8);
+
+  var c: int64 := b.Cell(0, 0);
+  Check("  zelle 0/0 note", CellNote(c), 25);
+  Check("  zelle 0/0 instr", CellInstr(c), 33);
+  Check("  zelle 0/0 cmd", CellCmd(c), 0x0C);
+  Check("  zelle 0/0 level", CellLevel(c), 0x40);
+
+  var c2: int64 := b.Cell(2, 1);
+  Check("  zelle 2/1 note", CellNote(c2), 37);
+  Check("  zelle 2/1 instr", CellInstr(c2), 2);
+  Check("  zelle 2/1 level", CellLevel(c2), 0x64);
+
+  var i1: TInstrument := s.Instrument(1);
+  PrintStr("  instrument 1: ");
+  PrintStrLn(i1.Name);
+  Check("  i1 volume", i1.Volume, 64);
+  Check("  i1 replen (worte)", i1.RepeatLen, 32);
+  Check("  i1 samplelen", i1.SampleLen, 64);
+
+  var i2: TInstrument := s.Instrument(2);
+  PrintStr("  instrument 2: ");
+  PrintStrLn(i2.Name);
+  Check("  i2 midi kanal", i2.MidiChannel, 3);
+  Check("  i2 midi preset", i2.MidiPreset, 7);
+  Check("  i2 transpose", i2.Transpose, -2);
+  Check("  i2 samplelen", i2.SampleLen, 32);
+}
+
+fn main(): int64 {
+  var p0: TTextBuffer := new TTextBuffer();
+
+  var s0: TSong := LoadMMD("/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/test.mmd0");
+  CheckSong("MMD0", s0);
+  if (s0 != null) {
+    Check("  sequenzlaenge", s0.SeqLen(), 3);
+    Check("  sequenz[1]", s0.SequenceEntry(1), 1);
+    Check("  sections", s0.SectionCount, 1);
+  }
+
+  var s1: TSong := LoadMMD("/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/test.mmd1");
+  CheckSong("MMD1", s1);
+  if (s1 != null) {
+    Check("  sequenzlaenge", s1.SeqLen(), 3);
+    // MMD1 kennt das volle Commandbyte: 1F passt in MMD0 nicht hinein.
+    Check("  zelle 2/1 cmd (voll)", CellCmd(s1.BlockAt(0).Cell(2, 1)), 0x1F);
+  }
+
+  var s2: TSong := LoadMMD("/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/test.mmd2");
+  CheckSong("MMD2", s2);
+  if (s2 != null) {
+    Check("  sections", s2.SectionCount, 2);
+    Check("  section 1 laenge", s2.Section(0).Len, 3);
+    Check("  section 2 laenge", s2.Section(1).Len, 2);
+    Check("  section 2 eintrag 0", s2.Section(1).Get(0), 1);
+  }
+
+  // ---- Rundlauf: schreiben und wieder lesen -------------------------------
+  // Der schaerfste Test fuer einen Schreiber ist der eigene Leser: was nach
+  // dem Speichern fehlt, faellt hier sofort auf.
+  if (s1 != null) {
+    s1.BlockAt(0).Name := "Intro";
+    if (!SaveMMD(s1, "/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/roundtrip.mmd1")) {
+      PrintStrLn("--- Speichern FEHLGESCHLAGEN");
+    } else {
+      var rt: TSong := LoadMMD("/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/roundtrip.mmd1");
+      CheckSong("Rundlauf (geschrieben und neu gelesen)", rt);
+      if (rt != null) {
+        Check("  sequenzlaenge", rt.SeqLen(), 3);
+        Check("  zelle 2/1 cmd", CellCmd(rt.BlockAt(0).Cell(2, 1)), 0x1F);
+        PrintStr("  blockname: ");
+        PrintStrLn(rt.BlockAt(0).Name);
+      }
+    }
+  }
+
+  // ---- Split und Join ------------------------------------------------------
+  // Geprueft wird nicht nur die Zellenverteilung, sondern auch die Playing
+  // Sequence: sie zeigt auf Blocknummern, und die verschieben sich beim
+  // Teilen und Verschmelzen.
+  if (s1 != null) {
+    PrintStrLn("--- Split / Join");
+    Check("  blocks vorher", s1.BlockCount, 2);
+    Check("  sequenz vorher [1]", s1.SequenceEntry(1), 1);
+
+    // Block 0 hat 8 Lines, Noten auf Line 0 (Track 0) und Line 2 (Track 1).
+    if (!s1.SplitBlockAt(0, 4)) { PrintStrLn("  SPLIT FEHLGESCHLAGEN"); }
+    Check("  blocks nach split", s1.BlockCount, 3);
+    Check("  oberer teil lines", s1.BlockAt(0).Lines, 4);
+    Check("  unterer teil lines", s1.BlockAt(1).Lines, 4);
+    Check("  note bleibt oben", CellNote(s1.BlockAt(0).Cell(0, 0)), 25);
+    // Der alte Block 1 ist jetzt Block 2 — die Sequence muss mitgezogen sein.
+    Check("  sequenz nach split [1]", s1.SequenceEntry(1), 2);
+
+    if (!s1.JoinWithNext(0)) { PrintStrLn("  JOIN FEHLGESCHLAGEN"); }
+    Check("  blocks nach join", s1.BlockCount, 2);
+    Check("  lines nach join", s1.BlockAt(0).Lines, 8);
+    Check("  note wieder auf 0/0", CellNote(s1.BlockAt(0).Cell(0, 0)), 25);
+    Check("  note wieder auf 2/1", CellNote(s1.BlockAt(0).Cell(2, 1)), 37);
+    Check("  sequenz nach join [1]", s1.SequenceEntry(1), 1);
+  }
+
+  // Eine Datei, die kein MMD ist, muss null liefern und darf nichts kaputt
+  // machen — der Editor faengt das ab und laeuft weiter.
+  var bad: TSong := LoadMMD("/tmp/claude-1000/-home-andreas-PhpstormProjects-lyx-octaMED/a734e77a-8b6c-45f2-880d-6915c492ced0/scratchpad/test.raw");
+  if (bad == null) { PrintStrLn("--- fremde Datei abgewiesen  OK"); }
+  else { PrintStrLn("--- fremde Datei NICHT abgewiesen"); }
+
+  p0.Destroy();
+  return 0;
+}

@@ -1,0 +1,808 @@
+// OMED/MMD.lyx — Lesen echter OctaMED-Module.
+//
+// MMD ist kein einheitliches Format, sondern eine Familie:
+//
+//   MMD0  Noten zu 3 Byte, 6-Bit-Notennummer, Instrument-Highbits im
+//         Notenbyte, Playing Sequence als 256 Bytes im Songkopf
+//   MMD1  Noten zu 4 Byte (Note / Instrument / Command / Datenbyte), Blocks
+//         mit 16-Bit-Massen und einem Infozeiger
+//   MMD2  wie MMD1, aber mit Sections: mehrere Playing Sequences, darueber
+//         eine Sektionsliste, und Trackvolumes als Zeiger statt als Feld
+//
+// Alle Zahlen sind big endian — die Dateien kommen vom 68000. Jedes Feld muss
+// deshalb byteweise zusammengesetzt werden; ein Cast auf int32 laese die Bytes
+// verdreht.
+//
+// Nicht gelesen (bewusst): Synth- und Hybridinstrumente, 16-Bit- und
+// Stereosamples, zusaetzliche Commandseiten (cmdpages) und die Mix-Mode-
+// Erweiterungen. Sie werden uebersprungen, nicht falsch geraten — ein
+// halb geladenes Synthinstrument klaenge schlimmer als ein leerer Platz.
+
+@description("OctaMED-Tracker - MMD0/MMD1/MMD2 lesen")
+@author("Andreas Roene")
+unit OMED.MMD;
+
+import std.fs;
+import Vega.Strings;
+import OMED.Song;
+
+pub con MMD_MAX_FILE: int64 := 16 * 1024 * 1024;
+
+// Songflags (flags im MMD0song).
+pub con MMD_FLAG_VOLHEX: int64 := 0x10;
+pub con MMD_FLAG_8CHANNEL: int64 := 0x40;
+// flags2: die unteren fuenf Bit sind LPB - 1, Bit 5 schaltet BPM-Zaehlung ein.
+pub con MMD_FLAG2_BMASK: int64 := 0x1F;
+pub con MMD_FLAG2_BPM: int64 := 0x20;
+
+// ---- Bytes lesen -----------------------------------------------------------
+
+fn U8(p: int64): int64 { return peek8(p); }
+
+fn I8(p: int64): int64 {
+  var v: int64 := peek8(p);
+  if (v > 127) { return v - 256; }
+  return v;
+}
+
+fn U16(p: int64): int64 {
+  return (peek8(p) << 8) | peek8(p + 1);
+}
+
+fn U32(p: int64): int64 {
+  return (peek8(p) << 24) | (peek8(p + 1) << 16) | (peek8(p + 2) << 8) | peek8(p + 3);
+}
+
+fn Tag4(p: int64, a: int64, b: int64, c: int64, d: int64): bool {
+  if (peek8(p) != a) { return false; }
+  if (peek8(p + 1) != b) { return false; }
+  if (peek8(p + 2) != c) { return false; }
+  if (peek8(p + 3) != d) { return false; }
+  return true;
+}
+
+// Nullterminierten Text aus der Datei in einen eigenen Puffer kopieren. Der
+// Zeiger muss den Song ueberleben, die Datei nicht.
+fn CopyText(src: int64, maxLen: int64): pchar {
+  var len: int64 := 0;
+  var done: bool := false;
+  while (len < maxLen) {
+    if (done) { len := maxLen; }
+    else {
+      if (peek8(src + len) == 0) { done := true; }
+      else { len := len + 1; }
+    }
+  }
+  var dst: int64 := alloc(len + 1);
+  var i: int64 := 0;
+  while (i < len) {
+    poke8(dst + i, peek8(src + i));
+    i := i + 1;
+  }
+  poke8(dst + len, 0);
+  return dst as pchar;
+}
+
+// ---- Reader ----------------------------------------------------------------
+// Der Reader haelt die geladene Datei und die Zeiger, die im Kopf stehen. Er
+// ist eine Klasse und keine Funktionskette, weil MMD2 dieselben Bausteine in
+// anderer Reihenfolge braucht — Blocks und Samples lesen sich gleich, nur der
+// Songkopf unterscheidet sich.
+pub type TMMDReader = class {
+  Data: int64;         // Dateipuffer
+  Size: int64;
+  Cap: int64;
+  Version: int64;      // 0, 1 oder 2
+  Song: TSong;
+
+  SongPtr: int64;
+  BlockArr: int64;
+  SmplArr: int64;
+  ExpData: int64;
+  NumBlocks: int64;
+  NumSamples: int64;
+
+  fn Create(): void {
+    self.Data := 0;
+    self.Size := 0;
+    self.Cap := 0;
+    self.Version := -1;
+    self.Song := null;
+    self.SongPtr := 0;
+    self.BlockArr := 0;
+    self.SmplArr := 0;
+    self.ExpData := 0;
+    self.NumBlocks := 0;
+    self.NumSamples := 0;
+  }
+
+  fn Free(): void {
+    if (self.Data != 0) {
+      free(self.Data, self.Cap);
+      self.Data := 0;
+    }
+  }
+
+  // Ein Zeiger aus der Datei ist ein Offset vom Dateianfang. Er wird geprueft,
+  // bevor er benutzt wird: eine kaputte Datei darf den Editor nicht in
+  // fremden Speicher schicken.
+  fn Valid(off: int64, need: int64): bool {
+    if (off <= 0) { return false; }
+    if (off >= self.Size) { return false; }
+    if (off + need > self.Size) { return false; }
+    return true;
+  }
+
+  fn At(off: int64): int64 { return self.Data + off; }
+
+  fn LoadFile(path: pchar): bool {
+    self.Cap := MMD_MAX_FILE;
+    var buf: int64 := alloc(self.Cap);
+    if (buf == 0) { return false; }
+    var n: int64 := ReadFile(path, buf as pchar, self.Cap);
+    if (n <= 0) {
+      free(buf, self.Cap);
+      self.Cap := 0;
+      return false;
+    }
+    self.Data := buf;
+    self.Size := n;
+    return true;
+  }
+
+  // ---- Kopf ---------------------------------------------------------------
+  // MMD0-Header, 52 Byte: Kennung, Modullaenge, Zeiger auf Songstruktur,
+  // Blockzeigerfeld, Samplezeigerfeld und expdata.
+  fn ReadHeader(): bool {
+    if (self.Size < 0x34) { return false; }
+    var p: int64 := self.Data;
+    if (Tag4(p, 77, 77, 68, 48)) { self.Version := 0; }        // MMD0
+    if (Tag4(p, 77, 77, 68, 49)) { self.Version := 1; }        // MMD1
+    if (Tag4(p, 77, 77, 68, 50)) { self.Version := 2; }        // MMD2
+    if (Tag4(p, 77, 77, 68, 51)) { self.Version := 2; }        // MMD3 wie MMD2
+    if (self.Version < 0) { return false; }
+
+    self.SongPtr := U32(p + 0x08);
+    self.BlockArr := U32(p + 0x10);
+    self.SmplArr := U32(p + 0x18);
+    self.ExpData := U32(p + 0x20);
+    return self.Valid(self.SongPtr, 4);
+  }
+
+  // ---- Songkopf -----------------------------------------------------------
+  // Gemeinsam ist MMD0/1 und MMD2 nur das Samplefeld am Anfang (63 Eintraege
+  // zu 8 Byte). Danach trennen sich die Formate.
+  fn SampleHeader(i: int64): int64 {
+    return self.At(self.SongPtr) + (i * 8);
+  }
+
+  fn ReadSongMMD01(): bool {
+    var s: int64 := self.At(self.SongPtr);
+    if (!self.Valid(self.SongPtr, 0x314)) { return false; }
+
+    self.NumBlocks := U16(s + 0x1F8);
+    var songLen: int64 := U16(s + 0x1FA);
+    var deftempo: int64 := U16(s + 0x2FC);
+    var flags: int64 := U8(s + 0x2FF);
+    var flags2: int64 := U8(s + 0x300);
+    var tempo2: int64 := U8(s + 0x301);
+    var mastervol: int64 := U8(s + 0x312);
+    self.NumSamples := U8(s + 0x313);
+
+    self.ApplySongFlags(deftempo, tempo2, flags, flags2, mastervol);
+
+    // Playing Sequence: 256 Bytes, jeder ein Blockindex.
+    var seq: TPlaySeq := self.Song.Seq();
+    var i: int64 := 0;
+    while (i < songLen) {
+      if (i >= 256) { i := songLen; }
+      else {
+        seq.Add(U8(s + 0x1FC + i));
+        i := i + 1;
+      }
+    }
+    return true;
+  }
+
+  // MMD2song: statt der 256 Bytes Sequence stehen hier Zeiger auf mehrere
+  // Playing Sequences (die Sections) und auf die Trackvolumes.
+  fn ReadSongMMD2(): bool {
+    var s: int64 := self.At(self.SongPtr);
+    if (!self.Valid(self.SongPtr, 0x340)) { return false; }
+
+    self.NumBlocks := U16(s + 0x1F8);
+    var numSections: int64 := U16(s + 0x1FA);
+    var playSeqTable: int64 := U32(s + 0x1FC);
+    var sectionTable: int64 := U32(s + 0x200);
+    var numPseqs: int64 := U16(s + 0x20A);
+
+    var deftempo: int64 := U16(s + 0x2FC);
+    var flags: int64 := U8(s + 0x2FF);
+    var flags2: int64 := U8(s + 0x300);
+    var tempo2: int64 := U8(s + 0x301);
+    var mastervol: int64 := U8(s + 0x312);
+    self.NumSamples := U8(s + 0x313);
+
+    self.ApplySongFlags(deftempo, tempo2, flags, flags2, mastervol);
+    self.ReadPlaySeqs(playSeqTable, numPseqs);
+
+    // Die Sektionsliste zeigt auf Playing Sequences; ohne sie bleibt es bei
+    // der Reihenfolge im Zeigerfeld, was fuer das Abspielen dasselbe ergibt.
+    if (numSections > 0) {
+      if (self.Valid(sectionTable, numSections * 2)) {
+        var first: int64 := U16(self.At(sectionTable));
+        if (first < self.Song.SectionCount) { self.Song.CurSection := first; }
+      }
+    }
+    return true;
+  }
+
+  fn ApplySongFlags(deftempo: int64, tempo2: int64, flags: int64,
+                    flags2: int64, mastervol: int64): void {
+    if (deftempo > 0) { self.Song.Tempo := deftempo; }
+    if (tempo2 > 0) { self.Song.Tpl := tempo2; }
+    self.Song.Lpb := (flags2 & MMD_FLAG2_BMASK) + 1;
+    self.Song.BpmMode := (flags2 & MMD_FLAG2_BPM) != 0;
+    self.Song.HexVolumes := (flags & MMD_FLAG_VOLHEX) != 0;
+    self.Song.EightChannel := (flags & MMD_FLAG_8CHANNEL) != 0;
+    if (mastervol > 0) { self.Song.MasterVolume := mastervol; }
+  }
+
+  // MMD2-PlaySeq: Name (32 Byte), zwei reservierte Langworte, Laenge, dann
+  // die Blocknummern als 16-Bit-Werte.
+  fn ReadPlaySeqs(table: int64, count: int64): void {
+    if (count < 1) { return; }
+    if (!self.Valid(table, count * 4)) { return; }
+
+    var i: int64 := 0;
+    while (i < count) {
+      var off: int64 := U32(self.At(table) + (i * 4));
+      if (self.Valid(off, 42)) {
+        var p: int64 := self.At(off);
+        var name: pchar := CopyText(p, 32);
+        var len: int64 := U16(p + 40);
+
+        // Die erste Sequence fuellt die Section, die jeder Song schon hat;
+        // jede weitere kommt dazu.
+        var seq: TPlaySeq := null;
+        if (i == 0) { seq := self.Song.Seq(); }
+        else { seq := self.Song.Section(self.Song.AddSection(name)); }
+        if (i == 0) { seq.Name := name; }
+
+        var k: int64 := 0;
+        while (k < len) {
+          if (!self.Valid(off + 42 + (k * 2), 2)) { k := len; }
+          else {
+            seq.Add(U16(p + 42 + (k * 2)));
+            k := k + 1;
+          }
+        }
+      }
+      i := i + 1;
+    }
+  }
+
+  // ---- Instrumente --------------------------------------------------------
+  // Die Kopfdaten stehen im Songkopf (rep, replen, midich, midipreset, svol,
+  // strans), die Sampledaten hinter einem Zeiger im Samplefeld, und die Namen
+  // in expdata. Drei Orte fuer ein Instrument — das ist MMD, nicht Absicht.
+  fn ReadInstruments(): void {
+    var names: int64 := 0;
+    var nameEntries: int64 := 0;
+    var nameSize: int64 := 0;
+    if (self.Valid(self.ExpData, 0x1C)) {
+      var e: int64 := self.At(self.ExpData);
+      names := U32(e + 0x14);
+      nameEntries := U16(e + 0x18);
+      nameSize := U16(e + 0x1A);
+    }
+
+    var i: int64 := 0;
+    while (i < self.NumSamples) {
+      var hdr: int64 := self.SampleHeader(i);
+      var ins: TInstrument := NewInstrument("");
+
+      ins.RepeatStart := U16(hdr);
+      ins.RepeatLen := U16(hdr + 2);
+      ins.MidiChannel := U8(hdr + 4);
+      ins.MidiPreset := U8(hdr + 5);
+      ins.Volume := U8(hdr + 6);
+      ins.Transpose := I8(hdr + 7);
+
+      // Name aus expdata, falls vorhanden.
+      if (names != 0) {
+        if (i < nameEntries) {
+          var noff: int64 := names + (i * nameSize);
+          if (self.Valid(noff, 1)) {
+            ins.Name := CopyText(self.At(noff), 40);
+          }
+        }
+      }
+
+      self.ReadSampleData(i, ins);
+      self.Song.AddInstrument(ins);
+      i := i + 1;
+    }
+  }
+
+  // InstrHdr: Laenge (32 Bit), Typ (16 Bit), dann die Daten. Typ 0 ist ein
+  // gewoehnliches 8-Bit-Sample; negative Typen sind Synth und Hybrid, Bit 4
+  // und 5 stehen fuer 16 Bit und Stereo. Alles davon wird uebersprungen.
+  fn ReadSampleData(index: int64, ins: TInstrument): void {
+    if (self.SmplArr == 0) { return; }
+    if (!self.Valid(self.SmplArr + (index * 4), 4)) { return; }
+    var off: int64 := U32(self.At(self.SmplArr) + (index * 4));
+    if (!self.Valid(off, 6)) { return; }
+
+    var p: int64 := self.At(off);
+    var len: int64 := U32(p);
+    var stype: int64 := U16(p + 4);
+    if (stype > 32767) { return; }           // negativ: Synth oder Hybrid
+    if ((stype & 0x10) != 0) { return; }     // 16 Bit
+    if ((stype & 0x20) != 0) { return; }     // Stereo
+    if (len < 1) { return; }
+    if (!self.Valid(off + 6, len)) { return; }
+
+    var data: int64 := alloc(len);
+    if (data == 0) { return; }
+    var k: int64 := 0;
+    while (k < len) {
+      poke8(data + k, peek8(p + 6 + k));
+      k := k + 1;
+    }
+    ins.SampleData := data;
+    ins.SampleLen := len;
+    ins.SampleRate := 8363;
+  }
+
+  // ---- Blocks -------------------------------------------------------------
+
+  fn ReadBlocks(): void {
+    if (self.BlockArr == 0) { return; }
+    var i: int64 := 0;
+    while (i < self.NumBlocks) {
+      if (!self.Valid(self.BlockArr + (i * 4), 4)) { i := self.NumBlocks; }
+      else {
+        var off: int64 := U32(self.At(self.BlockArr) + (i * 4));
+        var b: TBlock := null;
+        if (self.Version == 0) { b := self.ReadBlockMMD0(off); }
+        else { b := self.ReadBlockMMD1(off); }
+        if (b == null) { b := NewBlock(4, 64); }
+        self.Song.AddBlock(b);
+        i := i + 1;
+      }
+    }
+  }
+
+  // MMD0Block: numtracks (8 Bit), lines-1 (8 Bit), dann Noten zu 3 Byte.
+  //
+  // Notenbyte: die unteren sechs Bit sind die Notennummer, die oberen zwei
+  // die HOHEN Bits der Instrumentnummer — MMD0 quetscht 6 Bit Instrument in
+  // zwei Bytes, weil das dritte Byte fuer das Datenbyte gebraucht wird.
+  fn ReadBlockMMD0(off: int64): TBlock {
+    if (!self.Valid(off, 2)) { return null; }
+    var p: int64 := self.At(off);
+    var tracks: int64 := U8(p);
+    var lines: int64 := U8(p + 1) + 1;
+    if (tracks < 1) { return null; }
+    if (!self.Valid(off + 2, tracks * lines * 3)) { return null; }
+
+    var b: TBlock := NewBlock(tracks, lines);
+    var line: int64 := 0;
+    while (line < lines) {
+      var track: int64 := 0;
+      while (track < tracks) {
+        var c: int64 := p + 2 + (((line * tracks) + track) * 3);
+        var b0: int64 := peek8(c);
+        var b1: int64 := peek8(c + 1);
+        var b2: int64 := peek8(c + 2);
+
+        var note: int64 := b0 & 0x3F;
+        var instr: int64 := ((b0 & 0x80) >> 3) | ((b0 & 0x40) >> 1) | (b1 >> 4);
+        var cmd: int64 := b1 & 0x0F;
+        b.PutCell(line, track, CellPack(note, instr, cmd, b2));
+        track := track + 1;
+      }
+      line := line + 1;
+    }
+    return b;
+  }
+
+  // MMD1Block: numtracks und lines-1 als 16-Bit-Werte, ein Zeiger auf
+  // Blockinfo (Name, Commandseiten — hier nicht gelesen), dann Noten zu vier
+  // Byte: Note, Instrument, Command, Datenbyte, jedes in seinem eigenen Byte.
+  fn ReadBlockMMD1(off: int64): TBlock {
+    if (!self.Valid(off, 8)) { return null; }
+    var p: int64 := self.At(off);
+    var tracks: int64 := U16(p);
+    var lines: int64 := U16(p + 2) + 1;
+    var info: int64 := U32(p + 4);
+    if (tracks < 1) { return null; }
+    if (!self.Valid(off + 8, tracks * lines * 4)) { return null; }
+
+    var b: TBlock := NewBlock(tracks, lines);
+    var line: int64 := 0;
+    while (line < lines) {
+      var track: int64 := 0;
+      while (track < tracks) {
+        var c: int64 := p + 8 + (((line * tracks) + track) * 4);
+        b.PutCell(line, track,
+                  CellPack(peek8(c) & 0x7F, peek8(c + 1) & 0x3F,
+                           peek8(c + 2), peek8(c + 3)));
+        track := track + 1;
+      }
+      line := line + 1;
+    }
+
+    // MMDBlockInfo: hlmask, dann der Zeiger auf den Blocknamen (0x04) und
+    // dessen Laenge (0x08). Danach folgen pagetable und cmdexttable — die
+    // zusaetzlichen Commandseiten, die hier bewusst ungelesen bleiben.
+    if (self.Valid(info, 0x0C)) {
+      var ip: int64 := self.At(info);
+      var nameOff: int64 := U32(ip + 0x04);
+      if (self.Valid(nameOff, 1)) { b.Name := CopyText(self.At(nameOff), 64); }
+    }
+    return b;
+  }
+
+  // Songname aus expdata (Offset 0x2C = songname, 0x30 = songnamelen).
+  fn ReadSongName(): void {
+    if (!self.Valid(self.ExpData, 0x34)) { return; }
+    var e: int64 := self.At(self.ExpData);
+    var off: int64 := U32(e + 0x2C);
+    if (!self.Valid(off, 1)) { return; }
+    self.Song.Name := CopyText(self.At(off), 64);
+  }
+
+  // ---- Ganzes Modul -------------------------------------------------------
+  fn Load(path: pchar): TSong {
+    if (!self.LoadFile(path)) { return null; }
+    if (!self.ReadHeader()) {
+      self.Free();
+      return null;
+    }
+
+    self.Song := NewSong("MMD");
+    var ok: bool := false;
+    if (self.Version == 2) { ok := self.ReadSongMMD2(); }
+    else { ok := self.ReadSongMMD01(); }
+    if (!ok) {
+      self.Free();
+      return null;
+    }
+
+    self.ReadInstruments();
+    self.ReadBlocks();
+    self.ReadSongName();
+
+    // Ein Song ohne Block waere im Editor ein Absturz mit Ansage.
+    if (self.Song.BlockCount == 0) { self.Song.AddBlock(NewBlock(4, 64)); }
+    if (self.Song.SeqLen() == 0) { self.Song.AddSequenceEntry(0); }
+
+    self.Free();
+    return self.Song;
+  }
+}
+
+pub fn NewMMDReader(): TMMDReader {
+  return new TMMDReader();
+}
+
+// Bequemer Einstieg: Modul laden, Song zurueckgeben, sonst null.
+pub fn LoadMMD(path: pchar): TSong {
+  var r: TMMDReader := NewMMDReader();
+  return r.Load(path);
+}
+
+// ============================================================================
+// Schreiben (MMD1)
+// ============================================================================
+// Geschrieben wird ausschliesslich MMD1, obwohl gelesen werden alle drei
+// Stufen. Der Grund ist nicht Bequemlichkeit: MMD0 quetscht Notennummer und
+// Instrument in sechs Bit und kann ein Command ueber 0F gar nicht darstellen —
+// ein Song, der hier entsteht, passt also nicht zuverlaessig hinein. MMD2
+// wiederum brauchte man nur fuer Sections; solange nur die aktuelle Sequence
+// gesichert wird, waere das Format ohne Gewinn.
+//
+// Die Datei entsteht in EINEM Puffer, weil jeder Zeiger darin ein Offset vom
+// Dateianfang ist: erst wenn feststeht, wo etwas liegt, laesst sich der Zeiger
+// darauf eintragen. Deshalb wird zuerst der Inhalt hinter dem Kopf abgelegt
+// und der Kopf zuletzt nachgetragen.
+
+pub type TMMDWriter = class {
+  Buf: int64;
+  Cap: int64;
+  Pos: int64;
+
+  fn Create(): void {
+    self.Cap := MMD_MAX_FILE;
+    self.Buf := alloc(self.Cap);
+    self.Pos := 0;
+  }
+
+  fn Destroy(): void {
+    if (self.Buf != 0) { free(self.Buf, self.Cap); }
+    self.Buf := 0;
+  }
+
+  fn Room(n: int64): bool {
+    return (self.Pos + n) <= self.Cap;
+  }
+
+  fn PutU8(v: int64): void {
+    if (!self.Room(1)) { return; }
+    poke8(self.Buf + self.Pos, v & 0xFF);
+    self.Pos := self.Pos + 1;
+  }
+
+  fn PutU16(v: int64): void {
+    self.PutU8(v >> 8);
+    self.PutU8(v);
+  }
+
+  fn PutU32(v: int64): void {
+    self.PutU8(v >> 24);
+    self.PutU8(v >> 16);
+    self.PutU8(v >> 8);
+    self.PutU8(v);
+  }
+
+  // An eine feste Stelle schreiben, ohne die Schreibmarke zu bewegen: so
+  // werden die Zeiger nachgetragen, sobald ihr Ziel steht.
+  fn PokeU32(off: int64, v: int64): void {
+    if (off + 4 > self.Cap) { return; }
+    poke8(self.Buf + off, (v >> 24) & 0xFF);
+    poke8(self.Buf + off + 1, (v >> 16) & 0xFF);
+    poke8(self.Buf + off + 2, (v >> 8) & 0xFF);
+    poke8(self.Buf + off + 3, v & 0xFF);
+  }
+
+  fn PokeU16(off: int64, v: int64): void {
+    if (off + 2 > self.Cap) { return; }
+    poke8(self.Buf + off, (v >> 8) & 0xFF);
+    poke8(self.Buf + off + 1, v & 0xFF);
+  }
+
+  fn Zeros(n: int64): void {
+    var i: int64 := 0;
+    while (i < n) {
+      self.PutU8(0);
+      i := i + 1;
+    }
+  }
+
+  // Text mit fester Feldbreite, immer nullterminiert.
+  fn PutFixedText(s: pchar, width: int64): void {
+    var p: int64 := s as int64;
+    var i: int64 := 0;
+    var ende: bool := false;
+    while (i < width) {
+      var c: int64 := 0;
+      if (!ende) {
+        if (p == 0) { ende := true; }
+        else {
+          c := peek8(p + i);
+          if (c == 0) { ende := true; }
+        }
+      }
+      if (ende) { c := 0; }
+      if (i == width - 1) { c := 0; }
+      self.PutU8(c);
+      i := i + 1;
+    }
+  }
+
+  fn PutTextZ(s: pchar): int64 {
+    var start: int64 := self.Pos;
+    var p: int64 := s as int64;
+    if (p != 0) {
+      var i: int64 := 0;
+      var c: int64 := peek8(p);
+      while (c != 0) {
+        self.PutU8(c);
+        i := i + 1;
+        c := peek8(p + i);
+      }
+    }
+    self.PutU8(0);
+    return self.Pos - start;
+  }
+
+  // Auf gerade Adresse ausrichten. Die Amiga-Strukturen sind wortweise
+  // ausgerichtet, und ein Zeiger auf eine ungerade Adresse liess einen 68000
+  // mit einem Address Error stehen.
+  fn Align(): void {
+    if ((self.Pos % 2) != 0) { self.PutU8(0); }
+  }
+
+  fn Save(song: TSong, path: pchar): bool {
+    if (song == null) { return false; }
+    if (self.Buf == 0) { return false; }
+
+    var numSamples: int64 := song.InstrCount;
+    if (numSamples > OM_MAX_INSTR) { numSamples := OM_MAX_INSTR; }
+
+    // Kopf und Songstruktur bleiben zunaechst leer; ihre Felder werden
+    // nachgetragen, sobald die Offsets feststehen.
+    self.Zeros(0x34);
+    var songOff: int64 := self.Pos;
+    self.Zeros(0x314);
+
+    // ---- Sampledaten ------------------------------------------------------
+    var smplOffs: TIntArray := new TIntArray(64);
+    var i: int64 := 0;
+    while (i < numSamples) {
+      var ins: TInstrument := song.Instrument(i + 1);
+      self.Align();
+      smplOffs.Put(i, self.Pos);
+      var len: int64 := 0;
+      if (ins != null) { len := ins.SampleLen; }
+      self.PutU32(len);
+      self.PutU16(0);                       // Typ 0: gewoehnliches 8-Bit-Sample
+      if (ins != null) {
+        var k: int64 := 0;
+        while (k < len) {
+          self.PutU8(peek8(ins.SampleData + k));
+          k := k + 1;
+        }
+      }
+      i := i + 1;
+    }
+    self.Align();
+    var smplArr: int64 := self.Pos;
+    i := 0;
+    while (i < numSamples) {
+      self.PutU32(smplOffs.Get(i));
+      i := i + 1;
+    }
+
+    // ---- Blocks -----------------------------------------------------------
+    var blockOffs: TIntArray := new TIntArray(256);
+    var blocks: int64 := song.BlockCount;
+    if (blocks > 256) { blocks := 256; }
+    var b: int64 := 0;
+    while (b < blocks) {
+      var blk: TBlock := song.BlockAt(b);
+      self.Align();
+      blockOffs.Put(b, self.Pos);
+      var infoField: int64 := self.Pos + 4;   // hier steht spaeter der Zeiger
+
+      self.PutU16(blk.Tracks);
+      self.PutU16(blk.Lines - 1);
+      self.PutU32(0);
+
+      var line: int64 := 0;
+      while (line < blk.Lines) {
+        var track: int64 := 0;
+        while (track < blk.Tracks) {
+          var cell: int64 := blk.Cell(line, track);
+          self.PutU8(CellNote(cell) & 0x7F);
+          self.PutU8(CellInstr(cell) & 0x3F);
+          self.PutU8(CellCmd(cell));
+          self.PutU8(CellLevel(cell));
+          track := track + 1;
+        }
+        line := line + 1;
+      }
+
+      // MMDBlockInfo mit dem Blocknamen. Ohne ihn hiessen alle Blocks nach
+      // dem Laden wieder nur nach ihrer Nummer.
+      self.Align();
+      var infoOff: int64 := self.Pos;
+      self.PokeU32(infoField, infoOff);
+      var nameField: int64 := self.Pos + 4;
+      var lenField: int64 := self.Pos + 8;
+      self.PutU32(0);                       // hlmask
+      self.PutU32(0);                       // blockname (gleich nachgetragen)
+      self.PutU32(0);                       // blocknamelen
+      self.Zeros(6 * 4);                    // pagetable, cmdexttable, reserved
+      var nameOff: int64 := self.Pos;
+      var nameLen: int64 := self.PutTextZ(blk.Name);
+      self.PokeU32(nameField, nameOff);
+      self.PokeU32(lenField, nameLen);
+      b := b + 1;
+    }
+    self.Align();
+    var blockArr: int64 := self.Pos;
+    b := 0;
+    while (b < blocks) {
+      self.PutU32(blockOffs.Get(b));
+      b := b + 1;
+    }
+
+    // ---- expdata: Instrumentnamen und Songname ----------------------------
+    self.Align();
+    var iinfo: int64 := self.Pos;
+    i := 0;
+    while (i < numSamples) {
+      var ins2: TInstrument := song.Instrument(i + 1);
+      var nm: pchar := "";
+      if (ins2 != null) { nm := ins2.Name; }
+      self.PutFixedText(nm, 40);
+      i := i + 1;
+    }
+
+    self.Align();
+    var songName: int64 := self.Pos;
+    var songNameLen: int64 := self.PutTextZ(song.Name);
+
+    self.Align();
+    var expData: int64 := self.Pos;
+    self.Zeros(0x38);
+    self.PokeU32(expData + 0x14, iinfo);
+    self.PokeU16(expData + 0x18, numSamples);
+    self.PokeU16(expData + 0x1A, 40);
+    self.PokeU32(expData + 0x2C, songName);
+    self.PokeU32(expData + 0x30, songNameLen);
+
+    // ---- Songstruktur nachtragen -----------------------------------------
+    i := 0;
+    while (i < numSamples) {
+      var ins3: TInstrument := song.Instrument(i + 1);
+      var o: int64 := songOff + (i * 8);
+      if (ins3 != null) {
+        self.PokeU16(o, ins3.RepeatStart);
+        self.PokeU16(o + 2, ins3.RepeatLen);
+        poke8(self.Buf + o + 4, ins3.MidiChannel & 0xFF);
+        poke8(self.Buf + o + 5, ins3.MidiPreset & 0xFF);
+        poke8(self.Buf + o + 6, ins3.Volume & 0xFF);
+        poke8(self.Buf + o + 7, ins3.Transpose & 0xFF);
+      }
+      i := i + 1;
+    }
+
+    self.PokeU16(songOff + 0x1F8, blocks);
+
+    // Gesichert wird die gerade gueltige Sequence: MMD1 kennt nur eine.
+    var seq: TPlaySeq := song.Seq();
+    var seqLen: int64 := 0;
+    if (seq != null) {
+      seqLen := seq.Len;
+      if (seqLen > 256) { seqLen := 256; }
+      var k2: int64 := 0;
+      while (k2 < seqLen) {
+        poke8(self.Buf + songOff + 0x1FC + k2, seq.Get(k2) & 0xFF);
+        k2 := k2 + 1;
+      }
+    }
+    self.PokeU16(songOff + 0x1FA, seqLen);
+
+    self.PokeU16(songOff + 0x2FC, song.Tempo);
+    var flags: int64 := 0;
+    if (song.HexVolumes) { flags := flags | MMD_FLAG_VOLHEX; }
+    if (song.EightChannel) { flags := flags | MMD_FLAG_8CHANNEL; }
+    poke8(self.Buf + songOff + 0x2FF, flags);
+    var flags2: int64 := (song.Lpb - 1) & MMD_FLAG2_BMASK;
+    if (song.BpmMode) { flags2 := flags2 | MMD_FLAG2_BPM; }
+    poke8(self.Buf + songOff + 0x300, flags2);
+    poke8(self.Buf + songOff + 0x301, song.Tpl & 0xFF);
+
+    var t: int64 := 0;
+    while (t < 16) {
+      poke8(self.Buf + songOff + 0x302 + t, 64);     // trkvol
+      t := t + 1;
+    }
+    poke8(self.Buf + songOff + 0x312, song.MasterVolume & 0xFF);
+    poke8(self.Buf + songOff + 0x313, numSamples & 0xFF);
+
+    // ---- Kopf -------------------------------------------------------------
+    poke8(self.Buf, 77); poke8(self.Buf + 1, 77);
+    poke8(self.Buf + 2, 68); poke8(self.Buf + 3, 49);       // "MMD1"
+    self.PokeU32(0x04, self.Pos);                           // modlen
+    self.PokeU32(0x08, songOff);
+    self.PokeU32(0x10, blockArr);
+    self.PokeU32(0x18, smplArr);
+    self.PokeU32(0x20, expData);
+
+    smplOffs.Destroy();
+    blockOffs.Destroy();
+    return WriteFile(path, self.Buf as pchar, self.Pos) == self.Pos;
+  }
+}
+
+pub fn SaveMMD(song: TSong, path: pchar): bool {
+  var w: TMMDWriter := new TMMDWriter();
+  var ok: bool := w.Save(song, path);
+  w.Destroy();
+  return ok;
+}

@@ -1,0 +1,70 @@
+// latencytest.lyx — wie viel Ton steht im Geraetepuffer, bevor ein Schreiben
+// blockiert? Genau das ist die Verzoegerung zwischen Bild und Ton.
+import std.io;
+import std.time;
+import OMED.Playback;
+import std.audio.alsa;
+import OMED.Audio;
+
+@cap(fs.write)
+extern fn snd_pcm_get_params(pcm: int64, bufPtr: int64, perPtr: int64): int64 link "libasound.so.2";
+@cap(fs.write)
+extern fn snd_pcm_avail_update(pcm: int64): int64 link "libasound.so.2";
+
+fn main(): int64 {
+  var a: TOmedAudio := NewOmedAudio();
+  if (!a.Open()) { PrintStrLn("kein Audiogeraet"); return 1; }
+
+  PrintStr("Prepare: ");
+  if (a.Prepare()) { PrintStrLn("ok"); } else { PrintStrLn("FEHLGESCHLAGEN"); }
+  PrintStr("Handle: ");
+  PrintIntLn(a.Handle);
+
+  var box: int64 := alloc(16);
+  poke64(box, 0);
+  poke64(box + 8, 0);
+  var rcp: int64 := snd_pcm_get_params(a.Handle, box, box + 8);
+  PrintStr("get_params rc="); PrintInt(rcp);
+  PrintStr("  buffer="); PrintInt(peek64(box));
+  PrintStr(" frames  period="); PrintInt(peek64(box + 8));
+  PrintStrLn(" frames");
+  PrintStr("avail vor dem Schreiben: "); PrintIntLn(snd_pcm_avail_update(a.Handle));
+
+  var frames: int64 := 882;                 // ein Tick bei Tempo 125
+  var buf: int64 := alloc(frames * 4);
+  var i: int64 := 0;
+  while (i < frames * 4) { poke8(buf + i, 0); i := i + 1; }
+
+  var start: int64 := NowMs();
+  var vorgepuffert: int64 := 0;
+  var n: int64 := 0;
+  var fehler: int64 := 0;
+  while (n < 60) {
+    var rc: int64 := ALSAWriteGeneric(a.Handle, buf, frames * 4, 2, 16);
+    if (rc < 0) {
+      fehler := fehler + 1;
+      if (fehler == 1) {
+        PrintStr("erster Fehlercode: ");
+        PrintIntLn(rc);
+      }
+    }
+    var jetzt: int64 := NowMs() - start;
+    // Solange das Schreiben sofort zurueckkehrt, laeuft der Puffer voll.
+    if (jetzt < 5) { vorgepuffert := vorgepuffert + 20; }
+    n := n + 1;
+  }
+  var gesamt: int64 := NowMs() - start;
+  PrintStr("avail nach 60 Ticks: "); PrintIntLn(snd_pcm_avail_update(a.Handle));
+
+  PrintStr("fehlgeschlagene Schreibvorgaenge: ");
+  PrintIntLn(fehler);
+  PrintStr("60 Ticks geschrieben in ");
+  PrintInt(gesamt);
+  PrintStrLn(" ms  (Sollwert 1200 ms)");
+  PrintStr("Puffer vor dem ersten Blockieren: rund ");
+  PrintInt(vorgepuffert);
+  PrintStrLn(" ms");
+  a.Flush();
+  a.Close();
+  return 0;
+}

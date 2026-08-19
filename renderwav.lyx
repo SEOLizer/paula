@@ -1,0 +1,153 @@
+// renderwav.lyx — den Song ohne Oberflaeche und ohne Soundkarte in eine
+// WAV-Datei rendern.
+//
+// Das schliesst die letzte Luecke in der Pruefkette: Sample-Loader, Mixer,
+// Backends und Replay-Engine sind einzeln geprueft, aber ob am Ende Musik
+// herauskommt, war bisher nur per Ohr feststellbar. Eine Datei laesst sich
+// anhoeren UND nachrechnen.
+//
+// Gerendert wird der eingebaute Demo-Song durch alle drei Backends, damit
+// hoerbar wird, was die Design-Spec verlangt: dieselbe Musik muss im
+// Paula-, im 8-Kanal- und im Mixer-Modus verschieden klingen.
+import std.io;
+import std.fs;
+import std.audio;
+import OMED.Song;
+import OMED.Sample;
+import OMED.Playback;
+import OMED.Replay;
+import OMED.MMD;
+import OMED.MOD;
+
+fn Show(label: pchar, v: int64): void {
+  PrintStr(label);
+  PrintStr(" = ");
+  PrintIntLn(v);
+}
+
+// Ein kleiner Song zum Hoeren, falls kein Modul angegeben wurde: eine
+// Basslinie, eine Melodie und ein Rechteck-Ersatzklang je Instrument.
+fn BuildDemo(): TSong {
+  var s: TSong := NewSong("Render Demo");
+  s.Tempo := 125;
+  s.Tpl := 6;
+  s.Lpb := 4;
+
+  var bass: TInstrument := NewInstrument("Bass");
+  MakeHeldSample(bass, 96, 40);
+  bass.Volume := 64;
+  bass.Hold := 10;
+  bass.Decay := 6;
+  s.AddInstrument(bass);
+
+  var lead: TInstrument := NewInstrument("Lead");
+  MakeHeldSample(lead, 24, 40);
+  lead.Volume := 48;
+  lead.Hold := 14;
+  lead.Decay := 5;
+  s.AddInstrument(lead);
+
+  var b: TBlock := NewBlock(4, 16);
+  b.Name := "Demo";
+
+  // Track 0: Bass auf jedem Beat, C-2 und G-1 im Wechsel.
+  b.PutCell(0, 0, CellPack(13, 1, 0, 0));      // C-2
+  b.PutCell(4, 0, CellPack(13, 1, 0, 0));
+  b.PutCell(8, 0, CellPack(8, 1, 0, 0));       // G-1
+  b.PutCell(12, 0, CellPack(8, 1, 0, 0));
+
+  // Track 1: Melodie mit Lautstaerkeverlauf und einem Arpeggio.
+  b.PutCell(0, 1, CellPack(25, 2, 0x0C, 0x30));   // C-3, Volume 48
+  b.PutCell(2, 1, CellPack(29, 2, 0, 0));         // E-3
+  b.PutCell(4, 1, CellPack(32, 2, 0, 0));         // G-3
+  b.PutCell(6, 1, CellPack(37, 2, 0x00, 0x47));   // C-4 mit Arpeggio 4/7
+  b.PutCell(10, 1, CellPack(32, 2, 0x0D, 0x02));  // G-3, Volume Slide runter
+  b.PutCell(14, 1, CellPack(25, 2, 0, 0));        // C-3
+
+  // Track 2: eine zweite Stimme eine Quinte darueber, damit im Paula-Modus
+  // die Kanalverteilung hoerbar wird (Kanal 0 und 3 links, 1 und 2 rechts).
+  b.PutCell(0, 2, CellPack(32, 2, 0x0C, 0x20));
+  b.PutCell(8, 2, CellPack(37, 2, 0, 0));
+
+  s.AddBlock(b);
+  s.AddSequenceEntry(0);
+  return s;
+}
+
+// Einen Durchlauf rendern und als WAV sichern. Rueckgabe: Spitzenwert, damit
+// der Aufrufer sieht, dass keine Stille geschrieben wurde.
+fn RenderTo(song: TSong, backend: TPlaybackBackend, sekunden: int64,
+            out: pchar): int64 {
+  backend.Init(OM_MIX_RATE);
+  var e: TReplayEngine := NewReplayEngine();
+  e.Attach(song, backend);
+  e.PlaySong();
+
+  var frames: int64 := OM_MIX_RATE * sekunden;
+  var pcm: int64 := alloc(frames * 4);
+  if (pcm == 0) { return 0; }
+
+  // Tickweise rendern, genau wie im Programm — nur ohne Soundkarte und ohne
+  // Warten. Was hier herauskommt, ist derselbe Datenstrom, der sonst an ALSA
+  // ginge.
+  var pos: int64 := 0;
+  while (pos < frames) {
+    if (!e.DoTick()) { pos := frames; }
+    else {
+      var n: int64 := e.FramesPerTick(OM_MIX_RATE);
+      if (pos + n > frames) { n := frames - pos; }
+      if (n < 1) { pos := frames; }
+      else {
+        var base: int64 := pcm + (pos * 4);
+        var z: int64 := 0;
+        while (z < n * 4) {
+          poke8(base + z, 0);
+          z := z + 1;
+        }
+        backend.RenderTick(base, n);
+        pos := pos + n;
+      }
+    }
+  }
+
+  var peak: int64 := 0;
+  var i: int64 := 0;
+  while (i < frames) {
+    var lo: int64 := peek8(pcm + i * 4);
+    var hi: int64 := peek8(pcm + i * 4 + 1);
+    var v: int64 := (hi << 8) | lo;
+    if (v > 32767) { v := v - 65536; }
+    if (v < 0) { v := -v; }
+    if (v > peak) { peak := v; }
+    i := i + 1;
+  }
+
+  var res: int64 := WAVSaveFile(out, pcm, frames * 4, OM_MIX_RATE, 2, 16);
+  free(pcm, frames * 4);
+  if (res != 0) { return 0; }
+  return peak;
+}
+
+fn main(): int64 {
+  // Liegt ein Modul daneben, wird das gerendert — sonst der eingebaute
+  // Demo-Song. So laesst sich pruefen, ob ein Stueck gleichmaessig klingt,
+  // ohne die Oberflaeche und die Soundkarte dazwischen.
+  var song: TSong := LoadMOD("/home/andreas/PhpstormProjects/lyx-octaMED/alone.mod");
+  if (song == null) { song := BuildDemo(); }
+  else { PrintStrLn("gerendert wird alone.mod"); }
+  var sekunden: int64 := 20;
+
+  // Derselbe Song durch alle drei Backends. Genau darum geht es in der
+  // Design-Spec: dieselbe Datei muss in jedem Modus hoerbar anders klingen.
+  Show("paula  peak",
+       RenderTo(song, NewPaula4ChannelBackend() as TPlaybackBackend,
+                sekunden, "alone-paula.wav"));
+  Show("8ch    peak",
+       RenderTo(song, NewOctaMed8ChannelBackend() as TPlaybackBackend,
+                sekunden, "alone-8ch.wav"));
+  Show("mixer  peak",
+       RenderTo(song, NewSoftwareMixerBackend(8) as TPlaybackBackend,
+                sekunden, "alone-mixer.wav"));
+  PrintStrLn("geschrieben: alone-paula.wav, alone-8ch.wav, alone-mixer.wav");
+  return 0;
+}
